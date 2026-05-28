@@ -1,6 +1,22 @@
 {
   "name": "filesystem",
-  "enabled": false,
-  "root": ".",
-  "notes": "Day 2 wiring. Restrict access to the runtime root."
+  "enabled": true,
+  "transport": "stdio",
+  "command": "npx",
+  "args": [
+    "-y",
+    "@modelcontextprotocol/server-filesystem",
+    "${ORCHESTRA_ROOT}"
+  ],
+  "env": {},
+  "roots": [
+    "${ORCHESTRA_ROOT}"
+  ],
+  "deny_paths": [
+    "${ORCHESTRA_ROOT}/.env",
+    "${ORCHESTRA_ROOT}/.venv",
+    "${ORCHESTRA_ROOT}/memory/sessions.db"
+  ],
+  "agents": ["Atlas", "Cody", "Scribe", "Scout"],
+  "notes": "Filesystem MCP restricted to the runtime root via ORCHESTRA_ROOT. The server itself enforces the root; deny_paths is an additional defense-in-depth signal for the orchestrator loader to refuse if seen in any tool call. No path traversal above the runtime root is permitted."
 }

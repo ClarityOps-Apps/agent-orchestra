@@ -1,6 +1,21 @@
 {
   "name": "github",
-  "enabled": false,
-  "env": ["GITHUB_TOKEN"],
-  "notes": "Day 2 wiring. Do not commit real credentials."
+  "enabled": true,
+  "transport": "stdio",
+  "command": "npx",
+  "args": [
+    "-y",
+    "@modelcontextprotocol/server-github"
+  ],
+  "env": {
+    "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+  },
+  "scope": {
+    "org": "${GITHUB_ORG}",
+    "default_org": "Clarity-Apps",
+    "repo": "${GITHUB_REPO}",
+    "default_repo": "agent-orchestra"
+  },
+  "agents": ["Atlas", "Cody", "Scribe"],
+  "notes": "GitHub MCP. PAT scoped to the Agent Orchestra repo; expected scopes: repo, read:org, workflow. Real token lives in .env (gitignored) or VPS environment — never committed. Push to main is a Human-approved-only action regardless of MCP capability."
 }

@@ -1,6 +1,17 @@
 {
   "name": "asana",
-  "enabled": false,
-  "env": ["ASANA_ACCESS_TOKEN"],
-  "notes": "Day 2 wiring. Do not commit real credentials."
+  "enabled": true,
+  "transport": "sse",
+  "url": "https://mcp.asana.com/sse",
+  "auth": "oauth",
+  "env": {
+    "ASANA_ACCESS_TOKEN": "${ASANA_ACCESS_TOKEN}"
+  },
+  "scope": {
+    "workspace_gid": "${ASANA_WORKSPACE_GID}",
+    "project_gid": "1215181692325579",
+    "project_name": "Agent Orchestra — Phase 1: Bootstrap the Platform"
+  },
+  "agents": ["Atlas", "Cody", "Scribe", "Scout"],
+  "notes": "Asana MCP. OAuth handled by the host; ASANA_ACCESS_TOKEN supported as a fallback for PAT-style auth. Real credentials live in .env (gitignored) or VPS environment — never committed."
 }
