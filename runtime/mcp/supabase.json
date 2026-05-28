@@ -1,0 +1,6 @@
+{
+  "name": "supabase",
+  "enabled": false,
+  "env": ["SUPABASE_ACCESS_TOKEN"],
+  "notes": "Future wiring. Customer/prod actions require Garrett approval."
+}

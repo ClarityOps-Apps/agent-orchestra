@@ -1,0 +1,6 @@
+{
+  "name": "github",
+  "enabled": false,
+  "env": ["GITHUB_TOKEN"],
+  "notes": "Day 2 wiring. Do not commit real credentials."
+}

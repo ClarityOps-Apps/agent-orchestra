@@ -1,0 +1,6 @@
+{
+  "name": "filesystem",
+  "enabled": false,
+  "root": ".",
+  "notes": "Day 2 wiring. Restrict access to the runtime root."
+}

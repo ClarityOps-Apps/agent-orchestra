@@ -1,0 +1,6 @@
+{
+  "name": "asana",
+  "enabled": false,
+  "env": ["ASANA_ACCESS_TOKEN"],
+  "notes": "Day 2 wiring. Do not commit real credentials."
+}

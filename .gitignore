@@ -1,0 +1,9 @@
+.DS_Store
+runtime/.env
+runtime/.venv/
+runtime/__pycache__/
+runtime/**/__pycache__/
+runtime/**/*.pyc
+runtime/memory/*.db
+runtime/memory/*.db-*
+runtime/memory/activity.log

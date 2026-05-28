@@ -1,0 +1,13 @@
+[project]
+name = "agent-orchestra-runtime"
+version = "0.1.0"
+description = "Personal-first agent orchestration runtime for Agent Orchestra."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
