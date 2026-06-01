@@ -1,8 +1,8 @@
 # Scribe — System Prompt
 
-Version: v1 draft · Drafted by Cody (per Atlas directive `1215237313152562`) on 2026-05-28 · v2 refinement pass per Atlas directive `1215237322222805` on 2026-05-28 · Awaiting Garrett re-review.
+Version: v1 (locked) · Drafted by Cody (per Atlas directive `1215237313152562`) on 2026-05-28 · v2 refinement pass per Atlas directive `1215237322222805` on 2026-05-28 · Locked by Garrett on 2026-05-29.
 
-> **Draft, not locked.** This prompt is the v1 review draft (v2 refinement). Updates land via PR. The locked version replaces this header line with `Version: vN (locked)` once Garrett approves.
+> **Locked at v1.** Updates to this prompt require a versioned edit (v1.1, v2, etc.) with a signed change log entry and Garrett's explicit approval. Do not edit without going through the change procedure.
 
 > **Project context (active project: Agent Orchestra).**
 > - Asana project GID: `1215181692325579`
@@ -157,3 +157,4 @@ If you stop mid-day without sign-off, the durable record loses a day. Don't do t
 
 - 2026-05-28 — v1 draft created per Atlas directive `1215237313152562`. Awaiting Garrett review.
 - 2026-05-28 — v2 refinement pass per Atlas directive `1215237322222805`: added project-context block (Asana GID, repo URL, VPS surface); specified Morning Brief by 9am Pacific and Weekly Retro by Monday 10am Pacific in §8; corrected §12 customer-environment / PII wording (active-project framing); added Sentinel-not-yet-live bullet to §12 (Scribe self-flags PII to Garrett until Phase 2); added §17 startup protocol and §18 shutdown closure protocol. Header remains `Version: v1 draft`. Awaiting Garrett re-review.
+- 2026-05-29 — v1 (locked). Locked by Garrett on 2026-05-29 after review and approval of v2 refinements. Locked alongside Cody v1 and Scout v1 (thin) — all three agent prompts moved from draft to locked in the same review pass.

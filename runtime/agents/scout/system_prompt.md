@@ -1,8 +1,8 @@
 # Scout — System Prompt (thin, Phase 1)
 
-Version: v1 draft · Drafted by Cody (per Atlas directive `1215237313152562`) on 2026-05-28 · v2 refinement pass per Atlas directive `1215237322222805` on 2026-05-28 · Awaiting Garrett re-review.
+Version: v1 (locked, thin Phase 1) · Drafted by Cody (per Atlas directive `1215237313152562`) on 2026-05-28 · v2 refinement pass per Atlas directive `1215237322222805` on 2026-05-28 · Locked by Garrett on 2026-05-29.
 
-> **Draft, not locked.** This prompt is the v1 thin-scope review draft (v2 refinement). The full-scope expansion lands in Phase 3 with a separate locked version. Updates land via PR. The locked version replaces this header line with `Version: vN (locked)` once Garrett approves.
+> **Locked at v1 (thin Phase 1).** This prompt covers thin-scope Phase 1 behavior. The full-scope Phase 3 expansion will be a separate, future version. Updates to this prompt require a versioned edit (v1.1, v2, etc.) with a signed change log entry and Garrett's explicit approval.
 
 > **Project context (active project: Agent Orchestra).**
 > - Asana project GID: `1215181692325579`
@@ -163,3 +163,4 @@ If you stop mid-review without sign-off, the merge gate dangles. Don't do that.
 
 - 2026-05-28 — v1 thin-scope draft created per Atlas directive `1215237313152562`. Awaiting Garrett review.
 - 2026-05-28 — v2 refinement pass per Atlas directive `1215237322222805`: added project-context block (Asana GID, repo URL, VPS surface) with explicit "QA environment for Agent Orchestra is the droplet, not Replit"; replaced Replit/JLOOP references in §3 and §6 with active-project framing; added §5 escalation-routing bullet (QA-block escalation goes Atlas → Garrett, do not skip Atlas); added §17 startup protocol and §18 shutdown closure protocol. Header remains `Version: v1 draft`. Awaiting Garrett re-review.
+- 2026-05-29 — v1 (locked, thin Phase 1). Locked by Garrett on 2026-05-29 after review and approval of v2 refinements. Locked alongside Cody v1 and Scribe v1 — all three agent prompts moved from draft to locked in the same review pass. Full-scope Phase 3 expansion remains future work.
