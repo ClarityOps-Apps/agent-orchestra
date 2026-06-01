@@ -65,6 +65,7 @@ The recommended structure gives Atlas orchestration authority, gives Cody implem
 | **Identity-Signing Rule** *(added)* | Every agent action — comments, commits, handoffs, Asana updates, PR descriptions — is signed with the agent's name and UTC timestamp. Example: `[Cody · 2026-05-27T14:32Z] Implemented webhook handler per Atlas spec. PR #142.` Anonymous or unsigned actions are rejected by the hooks layer. |
 | **Safety-Block Authority Rule** *(added)* | When Sentinel and Atlas disagree on a safety call, Sentinel's block stands. Atlas cannot override Sentinel on safety. The disagreement is escalated to Garrett with a one-paragraph summary of the disagreement, the trade-offs, and each agent's recommendation. |
 | **SME Synthesis Rule** *(added)* | Decisions requiring technical, operational, or domain expertise are synthesized by the appropriate SME agent before reaching Garrett. The SME presents a one-paragraph recommendation including: the recommended option, alternatives considered, trade-offs, reasoning, cost of being wrong, and a clear ask. Garrett's role is to judge the recommendation, not synthesize the answer. Raw technical questions are never routed to Garrett without SME synthesis first. |
+| **Routing Disclosure Rule** *(added)* | When producing messages or directives that may need to be relayed to another recipient, the producer explicitly states the routing at the end of the response. Format: `Routing for this turn: → [recipient(s)] · [one-sentence reason]`. Recipients are named (Cody, Atlas, Scribe, Scout, Sentinel, Garrett, Both) or `None — FYI only`. This eliminates inference work for the human-in-the-loop courier and prevents missed handoffs. Required of every agent producing relay-worthy content, including Claude/Cowork when acting as Atlas stand-in. |
 
 ---
 
@@ -186,6 +187,7 @@ The goal is not to remove the human from judgment. The goal is to remove the hum
 | §3 Core Governance Rules | Added Identity-Signing Rule | Restores per-action signing pattern from the original Gemini transcript |
 | §3 Core Governance Rules | Added Safety-Block Authority Rule | Defines what happens when Sentinel and Atlas disagree on safety |
 | §3 Core Governance Rules | Added SME Synthesis Rule | Garrett never receives raw technical questions; SMEs synthesize recommendations he judges |
+| §3 Core Governance Rules | Added Routing Disclosure Rule | When messages need relaying, the producer explicitly tags recipient and reason at the end of the response — eliminates inference work for Garrett and prevents missed handoffs. Added 2026-05-29 mid-Phase-1 build per Garrett's explicit ask. |
 | §7 Minimum Handoff Packet | Added signature line | Consistency with Identity-Signing Rule |
 | §8 Conflict Resolution | New section | Atlas draft had no defined mechanism for inter-agent disagreement |
 | §9 Enforcement Architecture | New section | Distinguishes hard-enforced (hooks) from soft-enforced (Sentinel) from audit-only; closes the "Sentinel can be persuaded" gap |
