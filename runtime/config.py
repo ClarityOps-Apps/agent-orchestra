@@ -26,9 +26,17 @@ def load_env_file(path: Path | None = None, override: bool = False) -> Path | No
     Values are never echoed. A missing file is not an error (allows
     env-only deployments such as systemd `EnvironmentFile=`).
 
+    Pre-existing `os.environ` entries are respected only if their current
+    value is non-empty. An empty pre-existing value (`KEY=`) is treated as
+    "not set" so that a real value from the `.env` file can populate it.
+    Without this, an `export KEY=` line in a parent shell rc would silently
+    suppress the matching `.env` value — discovered while validating 4.2
+    Anthropic credentials.
+
     Args:
         path: Path to the dotenv file. Defaults to `runtime/.env`.
-        override: When True, replace pre-existing `os.environ` values.
+        override: When True, replace pre-existing `os.environ` values
+            regardless of whether they are empty.
 
     Returns:
         The path that was loaded, or `None` if no file was found.
@@ -50,7 +58,9 @@ def load_env_file(path: Path | None = None, override: bool = False) -> Path | No
             value = value[1:-1]
         if not key:
             continue
-        if not override and key in os.environ:
+        if not override and os.environ.get(key):
+            # Only skip if there's a truthy pre-existing value; an empty
+            # pre-existing env var should be treated as unset.
             continue
         os.environ[key] = value
     return target
