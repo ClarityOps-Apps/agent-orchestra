@@ -323,3 +323,21 @@ The operating model is a living document. When it needs to change, follow this p
 
 **Receipts.** Operating Model change log entry; signed Garrett approval; commit SHA of the doc edit.
 **Escalation.** If a rule change has retroactive implications for in-flight work, halt that work and reroute per the new rule.
+
+---
+
+### SOP-18. Completion Standard Hygiene Sweep
+
+**Trigger.** Every working day, during Scribe's Morning Brief preparation (per SOP-01). Also fires on demand if Garrett or Atlas flags suspected drift.
+**Owner.** Scribe.
+
+**Steps.**
+1. Scribe queries Asana via MCP for all tasks in active projects where a signed closure comment is present in the comment trail (pattern: `[Agent · UTC] *closure*`, `*marked complete*`, or other Completion Standard wording) AND the task's `completed` flag is `false`.
+2. For each drift detected, Scribe posts a signed comment on the task naming: the closure comment GID, the agent who posted it, the date, and the Completion Standard Rule violated.
+3. Scribe surfaces the drift list in the day's Morning Brief with a count and per-task summary.
+4. Each drifted task is assigned to the agent who posted the closure comment for resolution. That agent either flips the status bit (if the work is genuinely done) or posts a corrected receipt explaining why the task is not yet complete.
+5. If the same agent drifts more than 3 times in a single working week, Scribe escalates to Atlas as a pattern. Atlas decides whether the agent's prompt needs refinement per SOP-17 (Editing the Operating Model Itself) or per a narrower prompt-edit procedure.
+6. If drift exceeds 10 tasks workspace-wide in a single sweep, Scribe escalates to Garrett with a one-paragraph summary for an operating-model review.
+
+**Receipts.** Drift report appended to the Morning Brief in Asana, signed by Scribe. Per-task drift comments posted on each affected task. Pattern escalations posted on M-active milestone with classification (single-agent vs. workspace-wide).
+**Escalation.** Repeated drift from a single agent → Atlas (prompt refinement). Workspace-wide drift → Garrett (operating-model review). Same-agent drift on tasks involving customer environments, secrets, or destructive operations → Garrett immediately (P1 escalation regardless of count).
