@@ -34,6 +34,26 @@ VALID_MESSAGE_TYPES: frozenset[str] = frozenset(
 )
 
 
+# Action surfaces (per Operating Model §4 and `hooks.approval_gates`).
+#
+# These constants are duplicated here intentionally to keep this types module
+# lightweight and free of a `hooks/` import dependency. They MUST stay aligned
+# with the canonical values in `runtime/hooks/approval_gates.py` (`SAFE`,
+# `GUARDED`, `HUMAN_APPROVED_ONLY`). If you add or rename a surface in either
+# place, mirror it in the other.
+ACTION_SURFACE_SAFE = "safe"
+ACTION_SURFACE_GUARDED = "guarded"
+ACTION_SURFACE_HUMAN_APPROVED_ONLY = "human-approved-only"
+
+VALID_ACTION_SURFACES: frozenset[str] = frozenset(
+    {
+        ACTION_SURFACE_SAFE,
+        ACTION_SURFACE_GUARDED,
+        ACTION_SURFACE_HUMAN_APPROVED_ONLY,
+    }
+)
+
+
 @dataclass(frozen=True)
 class Message:
     """A single chat-style message handed to a provider."""
@@ -116,10 +136,20 @@ class MessageEnvelope:
             raise ValueError("MessageEnvelope.target must be a non-empty string.")
         if not isinstance(self.message_type, str) or not self.message_type:
             raise ValueError("MessageEnvelope.message_type must be a non-empty string.")
+        if self.message_type not in VALID_MESSAGE_TYPES:
+            raise ValueError(
+                f"MessageEnvelope.message_type must be one of "
+                f"{sorted(VALID_MESSAGE_TYPES)}, got {self.message_type!r}."
+            )
         if not isinstance(self.content, str):
             raise TypeError("MessageEnvelope.content must be a string.")
         if not isinstance(self.action_surface, str) or not self.action_surface:
             raise ValueError("MessageEnvelope.action_surface must be a non-empty string.")
+        if self.action_surface not in VALID_ACTION_SURFACES:
+            raise ValueError(
+                f"MessageEnvelope.action_surface must be one of "
+                f"{sorted(VALID_ACTION_SURFACES)}, got {self.action_surface!r}."
+            )
         if self.parent_id is not None and (
             not isinstance(self.parent_id, str) or not self.parent_id
         ):

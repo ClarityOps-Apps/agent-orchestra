@@ -176,17 +176,41 @@ def _build_response(
     `target` is the original requester. The runtime applies the authoritative
     signature in real UTC; any model-emitted `[Name · placeholder]` prefix in
     `raw_content` becomes narrative under our outer signature.
+
+    Inbound-secret redaction is applied **inside the runtime signature** so
+    that the envelope's delivered `content` never carries token-shaped text
+    downstream. This matters because envelope `content` is what 4.5 will
+    surface to agent-visible output and what 4.6 may persist to disk; if the
+    model accidentally emits a credential-shaped string we don't want it to
+    flow past the runtime boundary.
+
+    Behavior summary:
+      - If `find_secrets(raw_content)` returns hits, the runtime-signed
+        `content` is built from `redact(raw_content)` (each matched pattern
+        replaced with `[REDACTED:<label>]`), and `metadata.raw_content_redacted`
+        stores the redacted-and-bounded copy for debugging.
+      - If no hits, the runtime-signed `content` is built from the raw model
+        output (stripped); `metadata.raw_content_redacted` mirrors it for
+        downstream 4.6 persistence without re-running detection.
+      - Detected secret kinds are always listed in
+        `metadata.raw_content_inbound_secret_hits` so 4.5/4.6 callers can
+        reason about provenance without seeing the original token.
     """
     trimmed = raw_content.strip()
     if not trimmed:
         trimmed = "(empty response from provider)"
-    signed_content = sign_action(sender, trimmed)
 
-    # Defense-in-depth: scan inbound content for secret patterns and store a
-    # redacted copy in metadata. We don't block delivery on inbound — the
-    # model already produced the content — but we don't propagate raw secrets
-    # to the metadata persistence layer either.
-    inbound_hits = find_secrets(raw_content)
+    # Defense-in-depth on the inbound model response. `secrets_check`
+    # detection drives BOTH content redaction (so delivered envelope.content
+    # is safe for 4.5/4.6) AND metadata redaction (so debug artifacts don't
+    # carry raw secrets either).
+    inbound_hits = find_secrets(trimmed)
+    if inbound_hits:
+        safe_for_delivery = redact(trimmed)
+    else:
+        safe_for_delivery = trimmed
+    signed_content = sign_action(sender, safe_for_delivery)
+
     redacted_raw = redact(raw_content) if inbound_hits else raw_content
     if len(redacted_raw) > MAX_RAW_CONTENT_METADATA_CHARS:
         redacted_raw = redacted_raw[:MAX_RAW_CONTENT_METADATA_CHARS] + "…[truncated]"
@@ -506,6 +530,108 @@ def dry_run() -> int:
         record("guarded-allow", ok, "guarded surface allows skip-provider OK" if ok else f"unexpected envelope: {env}")
     except Exception as exc:  # noqa: BLE001
         record("guarded-allow", False, f"raised {type(exc).__name__}: {exc}")
+
+    # Scenario 8 (addendum): inbound-response redaction. Feed `_build_response`
+    # a synthetic raw_content containing a token-shaped string and assert that
+    # the delivered envelope.content does NOT contain the original token, the
+    # metadata names the detected secret kind, and no provider call is needed
+    # for the check.
+    try:
+        token_shape = "sk-proj-AAAAAAAAAAAAAAAAAAAA"
+        synthetic_raw = (
+            f"Here is the requested key: {token_shape}. Acknowledged."
+        )
+        env = _build_response(
+            sender="Cody",
+            target="Atlas",
+            session_id=_new_id(),
+            parent_id=_new_id(),
+            raw_content=synthetic_raw,
+            model="claude-opus-4-8",
+            provider_family="anthropic",
+            finish_reason="end_turn",
+            usage={"input_tokens": 0, "output_tokens": 0},
+        )
+        leaked_in_content = token_shape in env.content
+        leaked_in_metadata_raw = token_shape in str(
+            env.metadata.get("raw_content_redacted", "")
+        )
+        detected_kinds = env.metadata.get("raw_content_inbound_secret_hits", [])
+        ok = (
+            not leaked_in_content
+            and not leaked_in_metadata_raw
+            and "openai_api_key" in detected_kinds
+            and env.content.startswith("[Cody · ")
+            and "[REDACTED:openai_api_key]" in env.content
+        )
+        record(
+            "inbound-redaction",
+            ok,
+            (
+                "delivered content redacted + metadata names kind"
+                if ok
+                else f"unexpected envelope (leaked_content={leaked_in_content}, "
+                f"leaked_metadata={leaked_in_metadata_raw}, kinds={detected_kinds})"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        record("inbound-redaction", False, f"raised {type(exc).__name__}: {exc}")
+
+    # Scenario 9 (addendum): direct MessageEnvelope construction with an
+    # invalid `message_type` must raise ValueError from __post_init__ — defense
+    # in depth so any future code path that bypasses `send_message` still
+    # fails closed.
+    try:
+        MessageEnvelope(
+            id=_new_id(),
+            session_id=_new_id(),
+            sender="Atlas",
+            target="Cody",
+            message_type="not_a_real_type",
+            content="anything",
+            action_surface=SAFE,
+            parent_id=None,
+            metadata={},
+            created_at=_utc_now(),
+        )
+        record("envelope-bad-message-type", False, "did NOT raise ValueError")
+    except ValueError:
+        record(
+            "envelope-bad-message-type",
+            True,
+            "MessageEnvelope rejected unknown message_type as expected",
+        )
+    except Exception as exc:  # noqa: BLE001
+        record("envelope-bad-message-type", False, f"raised {type(exc).__name__}: {exc}")
+
+    # Scenario 10 (addendum): direct MessageEnvelope construction with an
+    # invalid `action_surface` must raise ValueError from __post_init__.
+    try:
+        MessageEnvelope(
+            id=_new_id(),
+            session_id=_new_id(),
+            sender="Atlas",
+            target="Cody",
+            message_type=MESSAGE_TYPE_AGENT_MESSAGE,
+            content="anything",
+            action_surface="not_a_real_surface",
+            parent_id=None,
+            metadata={},
+            created_at=_utc_now(),
+        )
+        record("envelope-bad-action-surface", False, "did NOT raise ValueError")
+    except ValueError:
+        record(
+            "envelope-bad-action-surface",
+            True,
+            "MessageEnvelope rejected unknown action_surface as expected",
+        )
+    except Exception as exc:  # noqa: BLE001
+        record(
+            "envelope-bad-action-surface",
+            False,
+            f"raised {type(exc).__name__}: {exc}",
+        )
 
     for case in passes:
         print(sign_action("Cody", f"dry-run pass — {case}"))
