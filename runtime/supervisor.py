@@ -159,6 +159,54 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _blocker_record(*, phase: str, reason: str, **extra: Any) -> dict[str, Any]:
+    """Build a signed blocker record for `SupervisorRun.blockers`.
+
+    Every supervisor-owned halt point goes through this helper so that 4.6
+    persistence has an agent-signed human-readable artifact alongside the
+    structured metadata. The `signed_message` field is produced via
+    `sign_action('Atlas', ...)` with real UTC and matches the hooks-layer
+    signature format used by the rest of the runtime.
+
+    Args:
+        phase: short identifier for the halt site (e.g.
+            `preflight_secrets_check`, `plan_parse_or_validate`,
+            `step_1_blocker`, `finalizer_blocker`).
+        reason: human-readable reason. Should not contain secrets — the
+            caller is responsible for redacting before calling.
+        **extra: any additional structured fields the caller wants to
+            persist (e.g. `secret_kinds`, `envelope_id`, `step_id`,
+            `target`, `decision`, `blocker_phase`).
+
+    Returns:
+        dict with `phase`, `reason`, all `extra` fields, and a
+        `signed_message` Atlas signature line.
+    """
+    record: dict[str, Any] = {"phase": phase, "reason": reason}
+    record.update(extra)
+    record["signed_message"] = sign_action(
+        "Atlas", f"Supervisor blocker [{phase}]: {reason}"
+    )
+    return record
+
+
+def _error_record(*, phase: str, error: str, **extra: Any) -> dict[str, Any]:
+    """Build a signed error record for `SupervisorRun.errors`.
+
+    Same pattern as `_blocker_record` but for run-level errors (provider
+    exceptions, missing env, SDK import failures, last-resort catches).
+    The `signed_message` is produced via `sign_action('Atlas', ...)` so
+    4.6 persistence and any operator-facing surface (4.11 REST, future
+    flight deck) read a signed Atlas line per error.
+    """
+    record: dict[str, Any] = {"phase": phase, "error": error}
+    record.update(extra)
+    record["signed_message"] = sign_action(
+        "Atlas", f"Supervisor error [{phase}]: {error}"
+    )
+    return record
+
+
 def _summarize_directive(directive: str) -> str:
     """Produce a bounded, redacted directive summary for receipts/blockers.
 
@@ -205,9 +253,17 @@ def _planner_prompt(directive: str, max_steps: int) -> str:
         "must not appear as a step.\n"
         f"Valid action_surface values: {surfaces}.\n"
         f"Maximum {max_steps} steps. step.id is a 1-based integer.\n"
-        "If the directive cannot be safely planned, emit a JSON plan with "
-        '"steps": [] and a `summary` explaining why; the finalizer turn '
-        "will surface that to Garrett."
+        "Planning guidance:\n"
+        "- If the work can proceed, emit at least one valid step.\n"
+        "- If the next action requires Garrett's explicit approval before "
+        "any subagent runs, mark that step with "
+        'action_surface="human-approved-only". The runtime will halt at the '
+        "gate without calling the target provider and surface the pending "
+        "decision to Garrett.\n"
+        "- If you cannot plan a safe path at all, explain the blocker in "
+        "`summary` and omit risky steps. The runtime fails closed on a "
+        "zero-step plan, so this produces a recorded supervisor blocker "
+        "for Garrett rather than running anything unsafe."
     )
 
 
@@ -349,26 +405,41 @@ def _validate_plan(plan: dict[str, Any], max_steps: int) -> list[dict[str, Any]]
 # --- Provider-call wrappers (planner / step / finalizer) ---------------------
 
 
+DRY_RUN_DEFAULT_PLAN: dict[str, Any] = {
+    "summary": "Dry-run synthetic plan: one safe Cody acknowledgement step.",
+    "steps": [
+        {
+            "id": 1,
+            "target": "Cody",
+            "message": "Acknowledge the dry-run supervisor request.",
+            "action_surface": ACTION_SURFACE_SAFE,
+            "reason": "Supervisor dry-run smoke step.",
+        }
+    ],
+    "final_response_instruction": (
+        "Summarize Cody's acknowledgement for Garrett."
+    ),
+}
+
+
 def _planner_envelope_for_dry_run(
-    directive: str, session_id: str, parent_id: str | None
+    session_id: str,
+    parent_id: str | None,
+    content_override: str | None = None,
 ) -> MessageEnvelope:
-    """Synthetic planner envelope used by dry-run: contains a valid one-step plan."""
-    dry_plan = {
-        "summary": "Dry-run synthetic plan: one safe Cody acknowledgement step.",
-        "steps": [
-            {
-                "id": 1,
-                "target": "Cody",
-                "message": "Acknowledge the dry-run supervisor request.",
-                "action_surface": ACTION_SURFACE_SAFE,
-                "reason": "Supervisor dry-run smoke step.",
-            }
-        ],
-        "final_response_instruction": (
-            "Summarize Cody's acknowledgement for Garrett."
-        ),
-    }
-    payload = f"<orchestra_plan>{json.dumps(dry_plan)}</orchestra_plan>"
+    """Synthetic planner envelope used by dry-run.
+
+    By default the envelope contains a valid one-step plan. When
+    `content_override` is provided, that string becomes the planner's
+    pre-signature payload — allowing dry-run scenarios to inject
+    malformed-JSON / unknown-target / invalid-surface / max-step-overflow
+    planner outputs and verify the supervisor halt paths produce signed
+    Atlas blockers via the full `run_supervisor()` flow.
+    """
+    if content_override is None:
+        payload = f"<orchestra_plan>{json.dumps(DRY_RUN_DEFAULT_PLAN)}</orchestra_plan>"
+    else:
+        payload = content_override
     return MessageEnvelope(
         id=_new_id(),
         session_id=session_id,
@@ -388,16 +459,20 @@ def _plan_turn(
     session_id: str,
     max_steps: int,
     dry_run: bool,
+    planner_content_override: str | None = None,
 ) -> MessageEnvelope:
     """Run the planner turn. Returns the planner's response envelope.
 
     The envelope flows through the same 4.4 protocol used for subagent
     sends, so the secrets check, identity-sign, and runtime UTC stamping
     rules all apply uniformly.
+
+    `planner_content_override` is dry-run only; live runs ignore it and
+    invoke the real Atlas planner through `send_message`.
     """
     if dry_run:
         return _planner_envelope_for_dry_run(
-            directive, session_id, parent_id=None
+            session_id, parent_id=None, content_override=planner_content_override
         )
     return send_message(
         "Atlas",
@@ -552,23 +627,31 @@ def run_supervisor(
     *,
     max_steps: int = DEFAULT_MAX_STEPS,
     dry_run: bool = False,
+    _dry_run_planner_content: str | None = None,
 ) -> SupervisorRun:
     """Run one supervisor invocation and return a `SupervisorRun` record.
 
     See module docstring for the turn structure. This function never raises
     on planner/step/finalizer failures — every halt path returns a
-    `SupervisorRun` with the relevant status and a signed blocker envelope
-    or error record. Internal invariant violations (e.g. status enum drift)
-    are the only paths that raise.
+    `SupervisorRun` with the relevant status and a signed Atlas
+    blocker/error record. Internal invariant violations (e.g. status enum
+    drift) are the only paths that raise.
 
     Args:
         directive: Garrett's directive text.
         max_steps: maximum subagent steps the planner may emit. Clamped to
             [1, HARD_CAP_MAX_STEPS].
         dry_run: when True, no provider API calls are made. The planner
-            turn returns a canned valid plan; subagent and finalizer calls
-            use the 4.4 protocol's `_skip_provider=True` path. Used by the
-            module CLI's --dry-run and by CI/local checks without secrets.
+            turn returns a canned valid plan (or `_dry_run_planner_content`
+            when provided); subagent and finalizer calls use the 4.4
+            protocol's `_skip_provider=True` path. Used by the module
+            CLI's --dry-run and by CI/local checks without secrets.
+        _dry_run_planner_content: private dry-run-only hook. When `dry_run`
+            is True and a string is provided, this becomes the synthetic
+            planner envelope's pre-signature payload. Dry-run scenarios
+            use this to inject malformed plans, unknown targets, invalid
+            surfaces, etc. — verifying the supervisor's halt paths
+            produce signed Atlas blockers end-to-end. Ignored on live runs.
 
     Returns:
         SupervisorRun: in-memory record of the run (no persistence).
@@ -612,37 +695,45 @@ def run_supervisor(
     secrets_result = check_for_secrets(directive, actor="Atlas")
     if not secrets_result.allowed:
         blockers.append(
-            {
-                "phase": "preflight_secrets_check",
-                "reason": secrets_result.reason,
-                "secret_kinds": list(secrets_result.matches),
-            }
+            _blocker_record(
+                phase="preflight_secrets_check",
+                reason=secrets_result.reason,
+                secret_kinds=list(secrets_result.matches),
+            )
         )
         return finalize(SUPERVISOR_STATUS_BLOCKED)
 
     # --- Planner turn ---------------------------------------------------------
     try:
-        planner_envelope = _plan_turn(directive, session_id, max_steps_norm, dry_run)
+        planner_envelope = _plan_turn(
+            directive,
+            session_id,
+            max_steps_norm,
+            dry_run,
+            planner_content_override=_dry_run_planner_content if dry_run else None,
+        )
     except (UnknownAgentError, ProtocolError, MissingEnvError) as exc:
-        errors.append({"phase": "planner_call", "error": str(exc)})
+        errors.append(_error_record(phase="planner_call", error=str(exc)))
         return finalize(SUPERVISOR_STATUS_ERRORED)
     except ImportError as exc:
-        errors.append({"phase": "planner_sdk", "error": str(exc)})
+        errors.append(_error_record(phase="planner_sdk", error=str(exc)))
         return finalize(SUPERVISOR_STATUS_ERRORED)
     except Exception as exc:  # noqa: BLE001 - last-resort: don't surface raw traceback
         errors.append(
-            {"phase": "planner_call", "error": f"{type(exc).__name__}: {exc}"}
+            _error_record(
+                phase="planner_call", error=f"{type(exc).__name__}: {exc}"
+            )
         )
         return finalize(SUPERVISOR_STATUS_ERRORED)
 
     if planner_envelope.message_type == MESSAGE_TYPE_BLOCKER:
         blockers.append(
-            {
-                "phase": "planner_blocker",
-                "reason": "planner returned a blocker envelope",
-                "envelope_id": planner_envelope.id,
-                "metadata": dict(planner_envelope.metadata),
-            }
+            _blocker_record(
+                phase="planner_blocker",
+                reason="planner returned a blocker envelope",
+                envelope_id=planner_envelope.id,
+                planner_envelope_metadata=dict(planner_envelope.metadata),
+            )
         )
         return finalize(SUPERVISOR_STATUS_BLOCKED)
 
@@ -652,11 +743,11 @@ def run_supervisor(
         validated_steps = _validate_plan(plan, max_steps_norm)
     except PlanError as exc:
         blockers.append(
-            {
-                "phase": "plan_parse_or_validate",
-                "reason": str(exc),
-                "planner_envelope_id": planner_envelope.id,
-            }
+            _blocker_record(
+                phase="plan_parse_or_validate",
+                reason=str(exc),
+                planner_envelope_id=planner_envelope.id,
+            )
         )
         return finalize(SUPERVISOR_STATUS_BLOCKED)
 
@@ -675,37 +766,42 @@ def run_supervisor(
                 if step.response_envelope is not None
                 else None
             )
-            phase = step.response_envelope.metadata.get("blocker_phase") if step.response_envelope else None
+            inner_phase = (
+                step.response_envelope.metadata.get("blocker_phase")
+                if step.response_envelope is not None
+                else None
+            )
+            step_reason = (
+                step.response_envelope.metadata.get("blocker_reason")
+                if step.response_envelope is not None
+                else "step blocked"
+            )
             blockers.append(
-                {
-                    "phase": f"step_{step.id}_blocker",
-                    "reason": (
-                        step.response_envelope.metadata.get("blocker_reason")
-                        if step.response_envelope is not None
-                        else "step blocked"
-                    ),
-                    "step_id": step.id,
-                    "target": step.target,
-                    "envelope_id": (
+                _blocker_record(
+                    phase=f"step_{step.id}_blocker",
+                    reason=step_reason or "step blocked",
+                    step_id=step.id,
+                    target=step.target,
+                    envelope_id=(
                         step.response_envelope.id
                         if step.response_envelope is not None
                         else None
                     ),
-                    "blocker_phase": phase,
-                    "decision": decision,
-                }
+                    blocker_phase=inner_phase,
+                    decision=decision,
+                )
             )
             if decision == "pending-human-approval":
                 return finalize(SUPERVISOR_STATUS_PENDING_HUMAN_APPROVAL)
             return finalize(SUPERVISOR_STATUS_BLOCKED)
         if step.status == STEP_STATUS_ERRORED:
             errors.append(
-                {
-                    "phase": f"step_{step.id}_error",
-                    "step_id": step.id,
-                    "target": step.target,
-                    "reason": "send_message raised; see receipts",
-                }
+                _error_record(
+                    phase=f"step_{step.id}_error",
+                    error="send_message raised during step execution",
+                    step_id=step.id,
+                    target=step.target,
+                )
             )
             return finalize(SUPERVISOR_STATUS_ERRORED)
 
@@ -715,25 +811,27 @@ def run_supervisor(
             plan, tuple(steps), session_id, planner_envelope.id, dry_run
         )
     except (UnknownAgentError, ProtocolError, MissingEnvError) as exc:
-        errors.append({"phase": "finalizer_call", "error": str(exc)})
+        errors.append(_error_record(phase="finalizer_call", error=str(exc)))
         return finalize(SUPERVISOR_STATUS_ERRORED)
     except ImportError as exc:
-        errors.append({"phase": "finalizer_sdk", "error": str(exc)})
+        errors.append(_error_record(phase="finalizer_sdk", error=str(exc)))
         return finalize(SUPERVISOR_STATUS_ERRORED)
     except Exception as exc:  # noqa: BLE001
         errors.append(
-            {"phase": "finalizer_call", "error": f"{type(exc).__name__}: {exc}"}
+            _error_record(
+                phase="finalizer_call", error=f"{type(exc).__name__}: {exc}"
+            )
         )
         return finalize(SUPERVISOR_STATUS_ERRORED)
 
     if finalizer_envelope.message_type == MESSAGE_TYPE_BLOCKER:
         blockers.append(
-            {
-                "phase": "finalizer_blocker",
-                "reason": "finalizer returned a blocker envelope",
-                "envelope_id": finalizer_envelope.id,
-                "metadata": dict(finalizer_envelope.metadata),
-            }
+            _blocker_record(
+                phase="finalizer_blocker",
+                reason="finalizer returned a blocker envelope",
+                envelope_id=finalizer_envelope.id,
+                finalizer_envelope_metadata=dict(finalizer_envelope.metadata),
+            )
         )
         return finalize(SUPERVISOR_STATUS_BLOCKED)
 
@@ -746,12 +844,24 @@ def run_supervisor(
 def _supervisor_dry_run() -> int:
     """Exercise the supervisor without any provider API calls.
 
-    Scenarios: happy-path (synthetic plan → safe step → synthetic
-    finalizer); pre-flight secrets block; invalid planner JSON (direct
-    `_parse_plan`); plan validation failures (unknown target, invalid
-    surface, max-step overflow, empty steps, missing field); pending-human
-    -approval step (synthetic plan injected via _execute_step). Emits one
-    signed Cody line per scenario.
+    Scenarios fall into two groups:
+
+    (1) Unit-level halts (1–11): happy-path; pre-flight secrets block;
+        direct `_parse_plan` / `_validate_plan` failures (no block,
+        malformed JSON, unknown target, Atlas-as-subagent, invalid
+        surface, max-step overflow, empty steps, missing field); single
+        `_execute_step` against human-approved-only.
+
+    (2) Signed-halt-message scenarios (12–18, added in the 4.5 addendum):
+        each drives a full `run_supervisor(..., dry_run=True,
+        _dry_run_planner_content=...)` through a supervisor-owned halt
+        path and asserts the resulting blocker carries an Atlas-signed
+        `signed_message` line starting with `[Atlas · `. These cover
+        preflight-secrets, plan-no-block, plan-bad-json,
+        plan-unknown-target, plan-invalid-surface,
+        plan-max-step-overflow, and step-human-approved.
+
+    Emits one signed Cody line per scenario.
     """
     passes: list[str] = []
     failures: list[str] = []
@@ -916,6 +1026,215 @@ def _supervisor_dry_run() -> int:
     except Exception as exc:  # noqa: BLE001
         record("step-human-approved-only", False, f"raised {type(exc).__name__}: {exc}")
 
+    # --- Signed-halt-message scenarios (4.5 addendum) -----------------------
+    # Each scenario drives a full run_supervisor() through a supervisor-owned
+    # halt path and asserts that the resulting blocker / error record carries
+    # an Atlas-signed `signed_message` line. The signed-line property is what
+    # 4.6 persistence will rely on; verifying it here keeps the property
+    # under regression coverage without any provider API call.
+
+    def _signed_line_ok(record: dict[str, Any], expected_phase: str) -> tuple[bool, str]:
+        if not record:
+            return False, "no record"
+        if record.get("phase") != expected_phase:
+            return False, f"phase={record.get('phase')!r} (expected {expected_phase!r})"
+        sig = record.get("signed_message", "")
+        if not isinstance(sig, str) or not sig.startswith("[Atlas · "):
+            return False, f"signed_message missing or wrong format: {sig!r}"
+        return True, sig.split("]")[0] + "]"
+
+    # Scenario 12: signed-preflight-secrets
+    try:
+        run = run_supervisor(
+            "Use this key: sk-proj-AAAAAAAAAAAAAAAAAAAA",
+            dry_run=True,
+        )
+        ok = (
+            run.status == SUPERVISOR_STATUS_BLOCKED
+            and len(run.blockers) == 1
+        )
+        if ok:
+            sig_ok, sig_detail = _signed_line_ok(run.blockers[0], "preflight_secrets_check")
+            ok = sig_ok
+            detail = f"signed preflight blocker present ({sig_detail})" if ok else f"unsigned: {sig_detail}"
+        else:
+            detail = f"unexpected: status={run.status}, blockers={run.blockers}"
+        record("signed-preflight-secrets", ok, detail)
+    except Exception as exc:  # noqa: BLE001
+        record("signed-preflight-secrets", False, f"raised {type(exc).__name__}: {exc}")
+
+    # Scenario 13: signed-plan-no-block — planner output has no <orchestra_plan> block
+    try:
+        run = run_supervisor(
+            "Smoke test the no-block path.",
+            dry_run=True,
+            _dry_run_planner_content="Atlas narrative without a plan block.",
+        )
+        ok = (
+            run.status == SUPERVISOR_STATUS_BLOCKED
+            and len(run.blockers) == 1
+        )
+        if ok:
+            sig_ok, sig_detail = _signed_line_ok(run.blockers[0], "plan_parse_or_validate")
+            ok = sig_ok
+            detail = f"signed parse blocker present ({sig_detail})" if ok else f"unsigned: {sig_detail}"
+        else:
+            detail = f"unexpected: status={run.status}, blockers={run.blockers}"
+        record("signed-plan-no-block", ok, detail)
+    except Exception as exc:  # noqa: BLE001
+        record("signed-plan-no-block", False, f"raised {type(exc).__name__}: {exc}")
+
+    # Scenario 14: signed-plan-bad-json — block present but JSON malformed
+    try:
+        run = run_supervisor(
+            "Smoke test the bad-json path.",
+            dry_run=True,
+            _dry_run_planner_content="<orchestra_plan>{not valid json}</orchestra_plan>",
+        )
+        ok = (
+            run.status == SUPERVISOR_STATUS_BLOCKED
+            and len(run.blockers) == 1
+        )
+        if ok:
+            sig_ok, sig_detail = _signed_line_ok(run.blockers[0], "plan_parse_or_validate")
+            ok = sig_ok
+            detail = f"signed parse blocker present ({sig_detail})" if ok else f"unsigned: {sig_detail}"
+        else:
+            detail = f"unexpected: status={run.status}, blockers={run.blockers}"
+        record("signed-plan-bad-json", ok, detail)
+    except Exception as exc:  # noqa: BLE001
+        record("signed-plan-bad-json", False, f"raised {type(exc).__name__}: {exc}")
+
+    # Scenario 15: signed-plan-unknown-target — valid JSON, unknown subagent
+    try:
+        bad_plan = {
+            "summary": "x",
+            "steps": [
+                {"id": 1, "target": "Sentinel", "message": "m",
+                 "action_surface": ACTION_SURFACE_SAFE, "reason": "r"}
+            ],
+            "final_response_instruction": "n/a",
+        }
+        payload = f"<orchestra_plan>{json.dumps(bad_plan)}</orchestra_plan>"
+        run = run_supervisor(
+            "Smoke test the unknown-target path.",
+            dry_run=True,
+            _dry_run_planner_content=payload,
+        )
+        ok = (
+            run.status == SUPERVISOR_STATUS_BLOCKED
+            and len(run.blockers) == 1
+        )
+        if ok:
+            sig_ok, sig_detail = _signed_line_ok(run.blockers[0], "plan_parse_or_validate")
+            ok = sig_ok and "Sentinel" in run.blockers[0].get("reason", "")
+            detail = f"signed unknown-target blocker present ({sig_detail})" if ok else f"unsigned or wrong reason: {run.blockers[0]}"
+        else:
+            detail = f"unexpected: status={run.status}, blockers={run.blockers}"
+        record("signed-plan-unknown-target", ok, detail)
+    except Exception as exc:  # noqa: BLE001
+        record("signed-plan-unknown-target", False, f"raised {type(exc).__name__}: {exc}")
+
+    # Scenario 16: signed-plan-invalid-surface
+    try:
+        bad_plan = {
+            "summary": "x",
+            "steps": [
+                {"id": 1, "target": "Cody", "message": "m",
+                 "action_surface": "not-a-real-surface", "reason": "r"}
+            ],
+            "final_response_instruction": "n/a",
+        }
+        payload = f"<orchestra_plan>{json.dumps(bad_plan)}</orchestra_plan>"
+        run = run_supervisor(
+            "Smoke test the invalid-surface path.",
+            dry_run=True,
+            _dry_run_planner_content=payload,
+        )
+        ok = (
+            run.status == SUPERVISOR_STATUS_BLOCKED
+            and len(run.blockers) == 1
+        )
+        if ok:
+            sig_ok, sig_detail = _signed_line_ok(run.blockers[0], "plan_parse_or_validate")
+            ok = sig_ok and "action_surface" in run.blockers[0].get("reason", "")
+            detail = f"signed invalid-surface blocker present ({sig_detail})" if ok else f"unsigned or wrong reason: {run.blockers[0]}"
+        else:
+            detail = f"unexpected: status={run.status}, blockers={run.blockers}"
+        record("signed-plan-invalid-surface", ok, detail)
+    except Exception as exc:  # noqa: BLE001
+        record("signed-plan-invalid-surface", False, f"raised {type(exc).__name__}: {exc}")
+
+    # Scenario 17: signed-plan-max-step-overflow
+    try:
+        bad_plan = {
+            "summary": "x",
+            "steps": [
+                {"id": i, "target": "Cody", "message": "m",
+                 "action_surface": ACTION_SURFACE_SAFE, "reason": "r"}
+                for i in range(1, 8)  # 7 steps > default max 5
+            ],
+            "final_response_instruction": "n/a",
+        }
+        payload = f"<orchestra_plan>{json.dumps(bad_plan)}</orchestra_plan>"
+        run = run_supervisor(
+            "Smoke test the max-step-overflow path.",
+            dry_run=True,
+            _dry_run_planner_content=payload,
+            max_steps=5,
+        )
+        ok = (
+            run.status == SUPERVISOR_STATUS_BLOCKED
+            and len(run.blockers) == 1
+        )
+        if ok:
+            sig_ok, sig_detail = _signed_line_ok(run.blockers[0], "plan_parse_or_validate")
+            ok = sig_ok and "exceeds max_steps" in run.blockers[0].get("reason", "")
+            detail = f"signed overflow blocker present ({sig_detail})" if ok else f"unsigned or wrong reason: {run.blockers[0]}"
+        else:
+            detail = f"unexpected: status={run.status}, blockers={run.blockers}"
+        record("signed-plan-max-step-overflow", ok, detail)
+    except Exception as exc:  # noqa: BLE001
+        record("signed-plan-max-step-overflow", False, f"raised {type(exc).__name__}: {exc}")
+
+    # Scenario 18: signed-step-human-approved — full run halts pending approval
+    try:
+        gated_plan = {
+            "summary": "x",
+            "steps": [
+                {"id": 1, "target": "Cody", "message": "Do the gated thing.",
+                 "action_surface": ACTION_SURFACE_HUMAN_APPROVED_ONLY,
+                 "reason": "Surface gate test."}
+            ],
+            "final_response_instruction": "n/a",
+        }
+        payload = f"<orchestra_plan>{json.dumps(gated_plan)}</orchestra_plan>"
+        run = run_supervisor(
+            "Smoke test the human-approval gate path.",
+            dry_run=True,
+            _dry_run_planner_content=payload,
+        )
+        ok = (
+            run.status == SUPERVISOR_STATUS_PENDING_HUMAN_APPROVAL
+            and len(run.blockers) == 1
+            and len(run.steps) == 1
+            and run.steps[0].status == STEP_STATUS_BLOCKED
+        )
+        if ok:
+            sig_ok, sig_detail = _signed_line_ok(run.blockers[0], "step_1_blocker")
+            decision_ok = run.blockers[0].get("decision") == "pending-human-approval"
+            ok = sig_ok and decision_ok
+            detail = (
+                f"signed step blocker + pending-human-approval ({sig_detail})"
+                if ok
+                else f"unsigned or missing decision: {run.blockers[0]}"
+            )
+        else:
+            detail = f"unexpected: status={run.status}, steps={[s.status for s in run.steps]}, blockers={run.blockers}"
+        record("signed-step-human-approved", ok, detail)
+    except Exception as exc:  # noqa: BLE001
+        record("signed-step-human-approved", False, f"raised {type(exc).__name__}: {exc}")
+
     for case in passes:
         print(sign_action("Cody", f"supervisor dry-run pass — {case}"))
     for case in failures:
@@ -925,7 +1244,15 @@ def _supervisor_dry_run() -> int:
 
 
 def _format_run(run: SupervisorRun) -> str:
-    """Render a SupervisorRun as a human-readable block for CLI output."""
+    """Render a SupervisorRun as a human-readable block for CLI output.
+
+    Surfaces every signed blocker/error message Atlas produced so an
+    operator reading the CLI output of a blocked or errored run sees the
+    Atlas-signed line directly without inspecting dict internals. The
+    underlying structured record (with `phase`, `reason`/`error`, and any
+    extra metadata) is still printed below the signed line for full
+    fidelity.
+    """
     lines = [
         f"  run_id            : {run.run_id}",
         f"  session_id        : {run.session_id}",
@@ -937,11 +1264,31 @@ def _format_run(run: SupervisorRun) -> str:
         f"  dry_run           : {run.dry_run}",
         f"  planner_env_id    : {run.planner_envelope.id if run.planner_envelope else '-'}",
         f"  finalizer_env_id  : {run.finalizer_envelope.id if run.finalizer_envelope else '-'}",
-        f"  blockers          : {list(run.blockers)}",
-        f"  errors            : {list(run.errors)}",
         f"  plan.summary      : {run.plan.get('summary') if run.plan else '-'}",
         f"  steps             : {len(run.steps)}",
     ]
+    if run.blockers:
+        lines.append(f"  blockers          : {len(run.blockers)}")
+        for idx, blocker in enumerate(run.blockers, start=1):
+            signed = blocker.get("signed_message", "(no signed_message — pre-addendum record)")
+            lines.append(f"    [{idx}] {signed}")
+            for k, v in blocker.items():
+                if k == "signed_message":
+                    continue
+                lines.append(f"        {k}: {v}")
+    else:
+        lines.append("  blockers          : 0")
+    if run.errors:
+        lines.append(f"  errors            : {len(run.errors)}")
+        for idx, err in enumerate(run.errors, start=1):
+            signed = err.get("signed_message", "(no signed_message — pre-addendum record)")
+            lines.append(f"    [{idx}] {signed}")
+            for k, v in err.items():
+                if k == "signed_message":
+                    continue
+                lines.append(f"        {k}: {v}")
+    else:
+        lines.append("  errors            : 0")
     for step in run.steps:
         env = step.response_envelope
         lines.append(
@@ -966,7 +1313,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run the 11 supervisor scenarios without any provider API call.",
+        help="Run the 18 supervisor scenarios (11 unit + 7 signed-halt) without any provider API call.",
     )
     parser.add_argument(
         "--directive",
