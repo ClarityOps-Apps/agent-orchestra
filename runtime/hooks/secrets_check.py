@@ -41,8 +41,22 @@ class SecretCheckResult:
     matches: tuple[str, ...] = field(default_factory=tuple)
 
 
-def _decisions_dir() -> Path:
-    base = os.environ.get("ORCHESTRA_DECISIONS_DIR", "memory/decisions")
+# Hook-emitted audit trail. Per the M4 architecture decision (Asana comment
+# 1215434597282433): runtime audit logs live under `runtime/memory/audit/`,
+# separate from `runtime/memory/decisions/` which holds curated, human-authored
+# ADR-style receipts. The audit/ directory is gitignored and regenerated per
+# session; nothing here writes into decisions/ anymore.
+#
+# Env var resolution prefers ORCHESTRA_AUDIT_DIR. ORCHESTRA_DECISIONS_DIR is a
+# DEPRECATED alias kept for one compatibility window: it is honored only when
+# ORCHESTRA_AUDIT_DIR is unset. Remove the legacy fallback once no caller sets
+# it.
+def _audit_dir() -> Path:
+    base = (
+        os.environ.get("ORCHESTRA_AUDIT_DIR")
+        or os.environ.get("ORCHESTRA_DECISIONS_DIR")  # deprecated alias
+        or "memory/audit"
+    )
     path = Path(base)
     if not path.is_absolute():
         runtime_root = Path(__file__).resolve().parent.parent
@@ -53,7 +67,7 @@ def _decisions_dir() -> Path:
 
 def _log_block(actor: str, kinds: tuple[str, ...]) -> None:
     day = datetime.now(UTC).strftime("%Y-%m-%d")
-    target = _decisions_dir() / f"{day}.md"
+    target = _audit_dir() / f"{day}.md"
     entry = sign_action(
         actor,
         f"Secrets-check block: refused to pass payload containing {', '.join(kinds)}. Payload redacted.",

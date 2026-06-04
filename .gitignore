@@ -7,3 +7,4 @@ runtime/**/*.pyc
 runtime/memory/*.db
 runtime/memory/*.db-*
 runtime/memory/activity.log
+runtime/memory/audit/
