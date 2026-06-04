@@ -178,7 +178,7 @@ def record_human_decision(
         "Atlas",
         f"Human decision recorded for `{action}` by {actor}: {decision}. Rationale: {rationale}",
     )
-    _log_decision(entry)
+    _log_audit_entry(entry)
     return entry
 
 

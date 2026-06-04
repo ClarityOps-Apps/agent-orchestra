@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import os
+import tempfile
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 from agents.cody.cody import CodyAgent
 from atlas.atlas import AtlasAgent
-from hooks.approval_gates import check_approval_gate
+from hooks.approval_gates import check_approval_gate, record_human_decision
 from hooks.identity_signing import SignatureError, enforce_signed, sign_action
 from hooks.lifecycle import lifecycle_event
 from hooks.secrets_check import check_for_secrets
@@ -48,12 +51,67 @@ def run_noop(directive: str) -> list[str]:
 
 
 def run_self_test() -> None:
+    """Hook smoke checks. Exits with raise SystemExit on any failure.
+
+    Checks:
+      1. Identity-signing hook blocks unsigned actions.
+      2. `record_human_decision()` writes a signed Atlas line to the
+         current audit directory at `{ORCHESTRA_AUDIT_DIR}/{YYYY-MM-DD}.md`,
+         proving the hook → audit/ namespace split stays wired end to end.
+         Regression coverage for the hygiene addendum (M4 architecture
+         decision; Asana comment 1215434597282433).
+    """
+    # 1. Identity-signing hook.
     try:
         enforce_signed("unsigned action")
     except SignatureError:
         print(sign_action("Atlas", "Identity-signing hook blocks unsigned actions."))
-        return
-    raise SystemExit("Identity-signing hook failed to block an unsigned action.")
+    else:
+        raise SystemExit("Identity-signing hook failed to block an unsigned action.")
+
+    # 2. record_human_decision() → audit dir.
+    with tempfile.TemporaryDirectory(prefix="orchestra-self-test-audit-") as tmp:
+        previous_audit_env = os.environ.get("ORCHESTRA_AUDIT_DIR")
+        previous_decisions_env = os.environ.get("ORCHESTRA_DECISIONS_DIR")
+        os.environ["ORCHESTRA_AUDIT_DIR"] = tmp
+        # Clear the deprecated alias so it cannot accidentally shadow the
+        # primary env var inside this scope.
+        os.environ.pop("ORCHESTRA_DECISIONS_DIR", None)
+        try:
+            entry = record_human_decision(
+                "merge_to_main", "Garrett", "approve", "self-test"
+            )
+            if not entry.startswith("[Atlas · "):
+                raise SystemExit(
+                    "record_human_decision() returned an unsigned entry: "
+                    f"{entry!r}"
+                )
+            day = datetime.now(UTC).strftime("%Y-%m-%d")
+            audit_file = Path(tmp) / f"{day}.md"
+            if not audit_file.exists():
+                raise SystemExit(
+                    f"record_human_decision() did not write {audit_file} — "
+                    "audit-dir namespace split is broken."
+                )
+            content = audit_file.read_text(encoding="utf-8")
+            if entry not in content:
+                raise SystemExit(
+                    "record_human_decision() return value not found in "
+                    f"{audit_file}: {content!r}"
+                )
+        finally:
+            if previous_audit_env is None:
+                os.environ.pop("ORCHESTRA_AUDIT_DIR", None)
+            else:
+                os.environ["ORCHESTRA_AUDIT_DIR"] = previous_audit_env
+            if previous_decisions_env is not None:
+                os.environ["ORCHESTRA_DECISIONS_DIR"] = previous_decisions_env
+    print(
+        sign_action(
+            "Atlas",
+            "record_human_decision writes signed line to audit/{day}.md.",
+        )
+    )
 
 
 def run_daemon(interval_seconds: int) -> None:
