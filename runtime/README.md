@@ -59,6 +59,17 @@ python orchestra.py --self-test           # hook smoke checks
 python orchestra.py --daemon --interval N # long-lived heartbeat (systemd unit)
 ```
 
+## Runtime health-check (M4 4.9)
+
+A tiny stdlib-only health surface lives at `runtime/status.py`. Two CLI shapes:
+
+```bash
+uv run python -m status --json        # JSON payload; exit 0 on healthy
+uv run python -m status --self-test   # signed Atlas PASS line; exit 0 on healthy
+```
+
+The payload includes `service`, `ok`, `runtime_root`, `python_version`, `checked_at_utc`, and a `checks` array. No network, no secrets, no DB writes.
+
 ## VPS deployment prerequisite — `uv`
 
 The DigitalOcean runtime host (`agent-orchestra-1` at `159.89.86.113`) must have [`uv`](https://docs.astral.sh/uv/) (Astral's Python package + project manager) installed. From M4 onward, `pyproject.toml` declares runtime dependencies (`openai`, `anthropic`) that the supervisor loop, provider adapters, and factory all rely on, and `uv.lock` is the authoritative lockfile. `uv sync` installs the locked dependencies into `runtime/.venv` on every deploy; `uv run python -m llm.*` is how the factory and provider dry-runs / pings get executed.

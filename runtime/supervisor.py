@@ -372,6 +372,95 @@ def _normalize_max_steps(max_steps: int) -> int:
     return max(1, min(int(max_steps), HARD_CAP_MAX_STEPS))
 
 
+def _planner_tool_guidance() -> str:
+    """Build the planner's tool-call guidance section from tool_registry data.
+
+    Live introspection of ``TOOL_REGISTRY`` + ``allowed_tools_for`` keeps the
+    planner's understanding of the surface in sync with whatever the
+    registry currently exposes — no drift, no hand-maintained list. Atlas
+    (the planner) needs this section to know that the 4.7 ``tool_calls``
+    field exists on the plan schema and how to populate it. M4 4.9
+    integration finding: without explicit tool guidance, the planner emits
+    text-only steps and the demo cannot proceed autonomously.
+    """
+    sections: list[str] = [
+        "Tool calls (optional, M4 4.7 supervisor-mediated surface).",
+        "Each step MAY include an optional `tool_calls` array of supervisor-",
+        "mediated tool invocations. The runtime executes them through the",
+        "hook chain (permission → secrets_check → arg validation → approval",
+        "gate → execute → sign → redact → persist) BEFORE dispatching the",
+        "subagent message. The subagent sees the redacted signed tool",
+        "results folded into its message context as <orchestra_tool_results>,",
+        "so it can reason about real outputs without re-running anything.",
+        "",
+        "Use tool_calls when the next concrete action HAS a tool form:",
+        "  - reading or writing a file under the runtime root,",
+        "  - listing a directory,",
+        "  - running an allowlisted smoke command,",
+        "  - reading a known Asana task or GitHub repo/file/PR list,",
+        "  - opening a PR or creating a branch.",
+        "Reserve plain-text step messages for instructions, reasoning,",
+        "summaries, or work that does not have a tool form. Subagents",
+        "CANNOT execute tool calls of their own through plan-time text;",
+        "every executed tool action must be declared in the step's",
+        "tool_calls array so the supervisor can validate and run it.",
+        "",
+        "Per-step tool_call shape:",
+        '  {"tool_name": "<namespaced>", "args": {<object>}}',
+        "",
+        "Allowed tools per subagent (matrix sourced from tool_registry):",
+    ]
+    for agent in ("Cody", "Scribe", "Scout"):
+        tools = allowed_tools_for(agent)
+        # Group by server prefix for readability.
+        sections.append(f"  {agent}: {', '.join(tools)}")
+    sections.extend(
+        [
+            "",
+            "Required-arg shapes (validated at plan time AND at execute time):",
+            "  filesystem.read_file:        {path}",
+            "  filesystem.list_dir:         {path}",
+            "  filesystem.write_file:       {path, content}",
+            "  bash.run_smoke:              {command}  (Scout only;",
+            "                                must exactly match a canonical",
+            "                                smoke command — see registry)",
+            "  asana.get_task:              {task_id}",
+            "  asana.search_tasks:          {text}",
+            "  asana.add_comment:           {task_id, text}",
+            "  asana.update_task_status:    {task_id, completed}",
+            "  github.get_repo:             {owner, repo}",
+            "  github.get_file:             {owner, repo, path}",
+            "  github.list_prs:             {owner, repo}",
+            "  github.create_branch:        {owner, repo, branch, from_sha}",
+            "  github.open_pr:              {owner, repo, head, base, title}",
+            "  github.push_branch:          {branch}    (HUMAN-APPROVED-ONLY)",
+            "  github.merge_pr:             {owner, repo, pr_number}",
+            "                                            (HUMAN-APPROVED-ONLY)",
+            "",
+            "Human-approved-only tools (`github.push_branch`,",
+            "`github.merge_pr`) auto-halt the supervisor as",
+            "`pending_human_approval` without live execution — they are the",
+            "right way to model a merge/push gate inside a plan.",
+            "",
+            "Example step with explicit tool calls:",
+            "  {",
+            '    "id": 1, "target": "Cody",',
+            '    "message": "Read the existing CLI module then implement the',
+            '                health-check command at runtime/status.py.",',
+            '    "action_surface": "safe", "reason": "implementation step",',
+            '    "tool_calls": [',
+            '      {"tool_name": "filesystem.read_file",',
+            '       "args": {"path": "runtime/orchestra.py"}},',
+            '      {"tool_name": "filesystem.write_file",',
+            '       "args": {"path": "runtime/status.py",',
+            '                "content": "<full file contents>"}}',
+            "    ]",
+            "  }",
+        ]
+    )
+    return "\n".join(sections)
+
+
 def _planner_prompt(directive: str, max_steps: int) -> str:
     """Build the planner instruction passed to Atlas through send_message."""
     targets = ", ".join(sorted(VALID_SUBAGENT_TARGETS))
@@ -389,7 +478,7 @@ def _planner_prompt(directive: str, max_steps: int) -> str:
         '  "summary": "one-sentence summary of what you are doing",\n'
         '  "steps": [\n'
         '    {"id": 1, "target": "Cody", "message": "...", '
-        '"action_surface": "safe", "reason": "..."}\n'
+        '"action_surface": "safe", "reason": "...", "tool_calls": []}\n'
         "  ],\n"
         '  "final_response_instruction": "How Atlas should synthesize the '
         "final response after all steps run.\"\n"
@@ -398,14 +487,22 @@ def _planner_prompt(directive: str, max_steps: int) -> str:
         "Atlas self-calls are reserved for planner and finalizer turns and "
         "must not appear as a step.\n"
         f"Valid action_surface values: {surfaces}.\n"
-        f"Maximum {max_steps} steps. step.id is a 1-based integer.\n"
+        f"Maximum {max_steps} steps. step.id is a 1-based integer.\n\n"
+        + _planner_tool_guidance()
+        + "\n\n"
         "Planning guidance:\n"
         "- If the work can proceed, emit at least one valid step.\n"
+        "- If a step's concrete next action is a tool-shaped operation "
+        "(file read/write, smoke command, Asana/GitHub call), prefer "
+        "expressing it as a `tool_calls` entry rather than text the "
+        "subagent would have to interpret.\n"
         "- If the next action requires Garrett's explicit approval before "
         "any subagent runs, mark that step with "
         'action_surface="human-approved-only". The runtime will halt at the '
         "gate without calling the target provider and surface the pending "
-        "decision to Garrett.\n"
+        "decision to Garrett. A `human-approved-only` tool call (e.g. "
+        "`github.push_branch`) is the canonical way to model a merge/push "
+        "gate.\n"
         "- If you cannot plan a safe path at all, explain the blocker in "
         "`summary` and omit risky steps. The runtime fails closed on a "
         "zero-step plan, so this produces a recorded supervisor blocker "
