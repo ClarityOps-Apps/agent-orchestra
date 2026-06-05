@@ -233,6 +233,30 @@ def _status_to_exit_code(status: str) -> tuple[int, str]:
     return CLI_EXIT_ERRORED, f"unknown-status:{status}"
 
 
+def _redact_and_trim(text: object, limit: int = 200) -> str:
+    """Redact a free-form string, THEN trim it to ``limit`` characters.
+
+    The redact-then-trim order is the same property
+    ``supervisor._redact_and_cap`` enforces for the event feed (Atlas
+    addendum 1215463032931954 finding 3); applying it here keeps the
+    fallback blocker/error paths in
+    ``_print_blocker_context()`` from leaking secret-shaped substrings
+    when a token straddles the trim boundary. Atlas re-review
+    1215463656023603 reproduced a leak with a 28-char ``sk-proj-…``
+    token whose tail crossed the 200-char slice: cap-then-redact left a
+    10-char ``sk-proj-QQ`` partial in stdout because the partial no
+    longer matched the secret regex.
+
+    Centralizing both fallback paths through this helper prevents the
+    behavior from drifting between blocker and error rendering. The
+    helper accepts ``object`` so callers don't need to ``str()`` first.
+    """
+    redacted = redact(str(text) if text is not None else "")
+    if len(redacted) <= limit:
+        return redacted
+    return redacted[:limit] + "…[truncated]"
+
+
 def _print_blocker_context(run: Any) -> None:
     """When the CLI exits with operator-action-required, surface every
     persisted blocker / error / gate row in operator-friendly form so a
@@ -242,16 +266,16 @@ def _print_blocker_context(run: Any) -> None:
     error at record-build time (Atlas addendum 1215463032931954 finding
     4), so the persisted `signed_message` field is already secret-free.
     The fallback paths below — used only when a record arrives without
-    `signed_message` (legacy callers or test fixtures) — still apply
-    `redact()` defensively before signing so this surface cannot leak
-    even if a future producer drifts.
+    `signed_message` (legacy callers or test fixtures) — route through
+    ``_redact_and_trim`` so the redact-before-trim order matches the
+    rest of the runtime even if a future producer drifts.
     """
     for blocker in run.blockers:
         signed = blocker.get("signed_message")
         if signed:
             print(signed, flush=True)
         else:
-            reason = redact(str(blocker.get("reason", ""))[:200])
+            reason = _redact_and_trim(blocker.get("reason", ""))
             print(
                 sign_action(
                     "Atlas",
@@ -264,7 +288,7 @@ def _print_blocker_context(run: Any) -> None:
         if signed:
             print(signed, flush=True)
         else:
-            err_text = redact(str(error.get("error", ""))[:200])
+            err_text = _redact_and_trim(error.get("error", ""))
             print(
                 sign_action(
                     "Atlas",
@@ -322,15 +346,19 @@ def run_directive(
     # CLI start — print before doing real work so the operator sees the
     # invocation even if the supervisor immediately blocks.
     #
-    # Defensive redact() on the directive/resume summary: an operator
-    # could (intentionally or accidentally) pass a secret-shaped substring
-    # in the directive text, and the CLI start line is the first signed
-    # output before the supervisor's preflight has a chance to detect it.
-    # Belt-and-suspenders: mirror the 4.7 finding-1 posture here so no
-    # CLI output line ever surfaces a raw secret-shaped token.
+    # Defensive redact-then-trim on the directive/resume summary via
+    # ``_redact_and_trim``: an operator could (intentionally or
+    # accidentally) pass a secret-shaped substring in the directive text,
+    # and the CLI start line is the first signed output before the
+    # supervisor's preflight has a chance to detect it. Atlas re-review
+    # 1215463656023603 caught a sibling case in
+    # ``_print_blocker_context()`` where slicing happened BEFORE the
+    # redact pass; routing this site through the same helper ensures the
+    # 80-char summary cannot leak a partial secret if a token straddles
+    # the trim boundary.
     invocation = "resume" if resume_id else "directive"
     summary_text = directive or resume_id or ""
-    redacted_summary = redact(summary_text[:80])
+    redacted_summary = _redact_and_trim(summary_text, limit=80)
     print(
         sign_action(
             "Atlas",
@@ -715,6 +743,66 @@ def _cli_dry_run() -> int:
             f"raw_token_survived={synthetic_token in result}, "
             f"partial_token_survived={not no_partials}, "
             f"redact_fired={'[REDACTED:' in result}",
+        )
+
+        # Scenario A — fallback blocker/error trim boundary (Atlas
+        # re-review 1215463656023603). When _print_blocker_context()
+        # falls back to the synthetic-signing path (no signed_message
+        # on the record), the reason/error must be redacted BEFORE
+        # trimming. Atlas reproduced a leak with a synthetic token
+        # straddling the 200-char trim boundary: cap-then-redact left
+        # a 10-char ``sk-proj-QQ`` partial in stdout because the partial
+        # no longer matched the secret regex. After the fix, both raw
+        # full token AND any leading partial must be absent and the
+        # ``[REDACTED:`` marker must be present.
+        class _FakeRun:
+            pass
+
+        boundary_token = "sk-proj-QQQQQQQQQQQQQQQQQQQQ"
+        # 95 reps of 'x ' = 190 chars (ends in space → word boundary).
+        # Token at positions 190–217, straddles the 200-char trim cap.
+        filler = "x " * 95
+        fallback_blocker = {
+            "phase": "test_fallback_boundary_blocker",
+            "reason": filler + boundary_token + " tail",
+            # no signed_message → forces the fallback signing path.
+        }
+        fallback_error = {
+            "phase": "test_fallback_boundary_error",
+            "error": filler + boundary_token + " tail",
+        }
+        fake = _FakeRun()
+        fake.blockers = [fallback_blocker]
+        fake.errors = [fallback_error]
+
+        buf = io.StringIO()
+        saved = sys.stdout
+        sys.stdout = buf
+        try:
+            _print_blocker_context(fake)
+        finally:
+            sys.stdout = saved
+        boundary_out = buf.getvalue()
+        partial_substrings = [boundary_token[:n] for n in (10, 12, 16, 20)]
+        no_partials = all(p not in boundary_out for p in partial_substrings)
+        # Full marker ``[REDACTED:openai_api_key]`` may be partially
+        # sliced by the trim — the security property is "no raw or
+        # partial token survives", and the ``[REDACTED:`` substring
+        # being present proves redact() fired before the trim.
+        ok = (
+            boundary_token not in boundary_out
+            and no_partials
+            and "[REDACTED:" in boundary_out
+            # Both blocker and error fallback lines must have emitted.
+            and "phase=test_fallback_boundary_blocker" in boundary_out
+            and "phase=test_fallback_boundary_error" in boundary_out
+        )
+        record(
+            "fallback-blocker-trim-boundary",
+            ok,
+            f"raw_token_survived={boundary_token in boundary_out}, "
+            f"partial_token_survived={not no_partials}, "
+            f"redact_fired={'[REDACTED:' in boundary_out}",
         )
 
         # Scenario 9 — record-build sanitization (Atlas finding 4).
