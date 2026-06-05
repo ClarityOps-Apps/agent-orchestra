@@ -280,6 +280,23 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _redact_and_cap(line: str) -> str:
+    """Sanitize an event-feed line for the operator console.
+
+    Order matters: ``redact()`` first, then length cap. The reverse order
+    risks slicing a secret-shaped token in half, leaving partial
+    characters past the slice point that the redaction pass would never
+    see. Atlas addendum 1215463032931954 finding 3: redact-before-cap is
+    the only safe sequence; making it a single helper used by both
+    ``run_supervisor()`` and ``resume_supervisor()`` ``_emit`` closures
+    prevents the behavior from drifting between the two paths.
+    """
+    redacted = redact(line)
+    if len(redacted) <= EVENT_LINE_MAX_CHARS:
+        return redacted
+    return redacted[:EVENT_LINE_MAX_CHARS] + "…[truncated]"
+
+
 def _blocker_record(*, phase: str, reason: str, **extra: Any) -> dict[str, Any]:
     """Build a signed blocker record for `SupervisorRun.blockers`.
 
@@ -293,20 +310,25 @@ def _blocker_record(*, phase: str, reason: str, **extra: Any) -> dict[str, Any]:
         phase: short identifier for the halt site (e.g.
             `preflight_secrets_check`, `plan_parse_or_validate`,
             `step_1_blocker`, `finalizer_blocker`).
-        reason: human-readable reason. Should not contain secrets — the
-            caller is responsible for redacting before calling.
+        reason: human-readable reason. The runtime sanitizes it through
+            ``redact()`` at the record-build boundary (Atlas addendum
+            1215463032931954) so a caller that accidentally passes
+            ``str(exc)`` with secret-shaped substrings cannot leak the
+            raw value into ``signed_message`` or persistence.
         **extra: any additional structured fields the caller wants to
             persist (e.g. `secret_kinds`, `envelope_id`, `step_id`,
             `target`, `decision`, `blocker_phase`).
 
     Returns:
-        dict with `phase`, `reason`, all `extra` fields, and a
-        `signed_message` Atlas signature line.
+        dict with `phase`, `reason` (redacted), all `extra` fields, and a
+        `signed_message` Atlas signature line built from the redacted
+        reason.
     """
-    record: dict[str, Any] = {"phase": phase, "reason": reason}
+    safe_reason = redact(reason) if reason else reason
+    record: dict[str, Any] = {"phase": phase, "reason": safe_reason}
     record.update(extra)
     record["signed_message"] = sign_action(
-        "Atlas", f"Supervisor blocker [{phase}]: {reason}"
+        "Atlas", f"Supervisor blocker [{phase}]: {safe_reason}"
     )
     return record
 
@@ -316,14 +338,17 @@ def _error_record(*, phase: str, error: str, **extra: Any) -> dict[str, Any]:
 
     Same pattern as `_blocker_record` but for run-level errors (provider
     exceptions, missing env, SDK import failures, last-resort catches).
-    The `signed_message` is produced via `sign_action('Atlas', ...)` so
-    4.6 persistence and any operator-facing surface (4.11 REST, future
-    flight deck) read a signed Atlas line per error.
+    The ``error`` text is sanitized through ``redact()`` at the record-build
+    boundary so a caller passing ``str(exc)`` with a secret-shaped
+    substring cannot leak the raw value into ``signed_message``, the
+    in-memory ``SupervisorRun.errors`` tuple, or the persisted
+    ``decisions.reason_or_error`` column. Atlas addendum 1215463032931954.
     """
-    record: dict[str, Any] = {"phase": phase, "error": error}
+    safe_error = redact(error) if error else error
+    record: dict[str, Any] = {"phase": phase, "error": safe_error}
     record.update(extra)
     record["signed_message"] = sign_action(
-        "Atlas", f"Supervisor error [{phase}]: {error}"
+        "Atlas", f"Supervisor error [{phase}]: {safe_error}"
     )
     return record
 
@@ -1071,18 +1096,15 @@ def run_supervisor(
     # at the end). When event_sink is None (the existing supervisor
     # library/dry-run callers), all emit calls become no-ops and behavior
     # is byte-for-byte unchanged.
+    #
+    # The redact-before-cap sequence (Atlas addendum 1215463032931954
+    # finding 3) is centralized in `_redact_and_cap` so both
+    # `run_supervisor` and `resume_supervisor` emit identical bytes;
+    # see that helper for rationale.
     def _emit(signed: str | None) -> None:
         if event_sink is None or not signed:
             return
-        # Defensive redact + length cap. Existing signed artifacts
-        # (envelope.content, ToolCallResult.signed_message, blocker/error
-        # signed_message) are already redacted by their producers, but
-        # belt-and-suspenders here means even a future producer drift
-        # cannot leak a secret-shaped substring to the operator console.
-        capped = signed if len(signed) <= EVENT_LINE_MAX_CHARS else (
-            signed[:EVENT_LINE_MAX_CHARS] + "…[truncated]"
-        )
-        event_sink(redact(capped))
+        event_sink(_redact_and_cap(signed))
 
     def _emit_atlas(message: str) -> None:
         """Sign a synthetic CLI status line as Atlas and emit it."""
@@ -1559,13 +1581,13 @@ def resume_supervisor(
     load_env_file()
 
     # 4.8 — event sink (same shape as run_supervisor). No-op when None.
+    # Shares `_redact_and_cap` with run_supervisor so the two emit paths
+    # cannot drift on the redact-before-cap order (Atlas addendum
+    # 1215463032931954 finding 3).
     def _emit(signed: str | None) -> None:
         if event_sink is None or not signed:
             return
-        capped = signed if len(signed) <= EVENT_LINE_MAX_CHARS else (
-            signed[:EVENT_LINE_MAX_CHARS] + "…[truncated]"
-        )
-        event_sink(redact(capped))
+        event_sink(_redact_and_cap(signed))
 
     def _emit_atlas(message: str) -> None:
         _emit(sign_action("Atlas", message))

@@ -238,18 +238,24 @@ def _print_blocker_context(run: Any) -> None:
     persisted blocker / error / gate row in operator-friendly form so a
     human can read the run summary without inspecting the DB.
 
-    The supervisor already signed each artifact; we just print them.
+    The supervisor's `_blocker_record`/`_error_record` now redact reason/
+    error at record-build time (Atlas addendum 1215463032931954 finding
+    4), so the persisted `signed_message` field is already secret-free.
+    The fallback paths below — used only when a record arrives without
+    `signed_message` (legacy callers or test fixtures) — still apply
+    `redact()` defensively before signing so this surface cannot leak
+    even if a future producer drifts.
     """
     for blocker in run.blockers:
         signed = blocker.get("signed_message")
         if signed:
             print(signed, flush=True)
         else:
+            reason = redact(str(blocker.get("reason", ""))[:200])
             print(
                 sign_action(
                     "Atlas",
-                    f"Blocker phase={blocker.get('phase')} reason="
-                    f"{blocker.get('reason', '')[:200]}",
+                    f"Blocker phase={blocker.get('phase')} reason={reason}",
                 ),
                 flush=True,
             )
@@ -258,11 +264,11 @@ def _print_blocker_context(run: Any) -> None:
         if signed:
             print(signed, flush=True)
         else:
+            err_text = redact(str(error.get("error", ""))[:200])
             print(
                 sign_action(
                     "Atlas",
-                    f"Error phase={error.get('phase')} error="
-                    f"{error.get('error', '')[:200]}",
+                    f"Error phase={error.get('phase')} error={err_text}",
                 ),
                 flush=True,
             )
@@ -369,10 +375,16 @@ def run_directive(
         )
         return CLI_EXIT_ERRORED
     except Exception as exc:  # noqa: BLE001 - unexpected; surface signed.
+        # Atlas addendum 1215463032931954 finding 1: redact str(exc)
+        # before signing. A synthetic ``sk-proj-…`` token planted in
+        # the exception text was leaking to stdout inside the signed
+        # ``CLI end: unexpected RuntimeError`` line; defensive redact()
+        # at the output boundary mirrors the 4.7 finding-1 posture.
         print(
             sign_action(
                 "Atlas",
-                f"CLI end: unexpected {type(exc).__name__} — {exc}",
+                f"CLI end: unexpected {type(exc).__name__} — "
+                f"{redact(str(exc))}",
             ),
             flush=True,
         )
@@ -479,6 +491,14 @@ def _cli_dry_run() -> int:
             f"exit={code}, lines={out.count(chr(10))}, "
             f"complete_in_out={'exit=0 (complete)' in out}",
         )
+        # Capture the run_id explicitly for scenario 4 — picking
+        # ``list_sessions(limit=1)`` later would race scenarios 2/3
+        # because session_store ``created_at`` is second-resolution.
+        complete_run_id: str | None = None
+        for line in out.splitlines():
+            if "Supervisor complete: run_id=" in line:
+                complete_run_id = line.split("run_id=", 1)[1].split()[0]
+                break
 
         # Scenario 2 — secret-shaped directive: preflight blocker, exit 10.
         # Belt-and-suspenders on finding 1: the CLI start line must NOT
@@ -532,21 +552,17 @@ def _cli_dry_run() -> int:
 
         # Scenario 4 — resume terminal-state from scenario 1 prints the
         # rehydrated run without re-running providers; exit 0.
-        from session_store import SessionStore as _SS  # noqa: PLC0415
-
-        recent = _SS(db_path).list_sessions(limit=1)
-        target_run_id = recent[0].run_id if recent else None
-        if target_run_id is None:
+        if complete_run_id is None:
             record(
                 "resume-terminal-state-exit-0",
                 False,
-                "no persisted session to resume against",
+                "scenario 1 did not yield a complete run_id",
             )
         else:
             code, out = _capture(
                 run_directive,
                 directive=None,
-                resume_id=target_run_id,
+                resume_id=complete_run_id,
                 dry_run=True,
                 max_steps=3,
                 db_path=db_path,
@@ -559,7 +575,7 @@ def _cli_dry_run() -> int:
             record(
                 "resume-terminal-state-exit-0",
                 ok,
-                f"exit={code}, target_run_id={target_run_id[:8]}…",
+                f"exit={code}, target_run_id={complete_run_id[:8]}…",
             )
 
         # Scenario 5 — exit-code mapping invariants.
@@ -608,6 +624,129 @@ def _cli_dry_run() -> int:
             "signed-feed-printable",
             ok,
             f"feed_lines={len(feed_lines)}",
+        )
+
+        # Scenario 7 — Atlas addendum 1215463032931954 finding 1:
+        # force run_supervisor() to raise an exception whose str(exc)
+        # contains a synthetic secret-shaped token. Without the fix,
+        # the raw token leaks to stdout in the signed CLI end line.
+        # With the fix, the redact() wrapper substitutes
+        # ``[REDACTED:openai_api_key]`` and exit=1 still surfaces.
+        import supervisor as _sv  # noqa: PLC0415
+
+        synthetic_token = "sk-proj-GGGGGGGGGGGGGGGGGGGG"
+        original_run = _sv.run_supervisor
+
+        def _boom(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError(
+                f"simulated upstream failure leaking {synthetic_token} "
+                "in str(exc)"
+            )
+
+        _sv.run_supervisor = _boom
+        try:
+            code, out = _capture(
+                run_directive,
+                directive="reproduce exception leak",
+                resume_id=None,
+                dry_run=True,
+                max_steps=1,
+                db_path=db_path,
+            )
+        finally:
+            _sv.run_supervisor = original_run
+
+        ok = (
+            code == CLI_EXIT_ERRORED
+            and synthetic_token not in out
+            and "[REDACTED:openai_api_key]" in out
+            and "CLI end: unexpected RuntimeError" in out
+        )
+        record(
+            "cli-exception-str-redacted",
+            ok,
+            f"exit={code}, raw_token_in_stdout={synthetic_token in out}, "
+            f"redaction_marker={'[REDACTED:openai_api_key]' in out}",
+        )
+
+        # Scenario 8 — redact-before-cap helper proof. The torture string
+        # positions the secret-shaped token to STRADDLE the byte-cap
+        # boundary: under the broken cap-first order, the cap would land
+        # mid-token leaving a substring like ``sk-proj-GG`` that no
+        # longer matches the redact regex, so the partial token would
+        # leak. Under redact-first (correct), the whole token is
+        # replaced by the marker before any slicing — neither the raw
+        # token NOR any leading partial of it can appear in the output.
+        from supervisor import (  # noqa: PLC0415
+            EVENT_LINE_MAX_CHARS as _MAX,
+            _redact_and_cap as _rc,
+        )
+
+        prefix = "[Atlas · 2026-06-05T20:17Z] "
+        # Token starts ~10 chars before the cap, with explicit spaces on
+        # both sides so redact()'s ``\b`` anchor fires the way it does
+        # on every real supervisor-emitted line. Under cap-first the cap
+        # would land inside the token and leak a partial; under
+        # redact-first (correct) the token is replaced with the marker
+        # before any slicing.
+        # ``filler`` is plain dots so we control the boundary byte
+        # explicitly — the byte just before the token is always a space.
+        filler_len = _MAX - len(prefix) - len(" ") - 10
+        filler = "." * filler_len
+        torture = prefix + filler + " " + synthetic_token + " tail"
+        result = _rc(torture)
+        partial_substrings = [synthetic_token[:n] for n in (10, 12, 16, 20)]
+        no_partials = all(p not in result for p in partial_substrings)
+        # Marker may be partially sliced by the cap; the security
+        # property is "no raw or partial token survives", and the
+        # marker-start substring "[REDACTED:" being present proves
+        # redact() fired before the cap. The full marker is not
+        # required.
+        ok = (
+            synthetic_token not in result
+            and no_partials
+            and result.startswith(prefix)
+            and "[REDACTED:" in result
+        )
+        record(
+            "redact-before-cap-no-split",
+            ok,
+            f"result_len={len(result)}, "
+            f"raw_token_survived={synthetic_token in result}, "
+            f"partial_token_survived={not no_partials}, "
+            f"redact_fired={'[REDACTED:' in result}",
+        )
+
+        # Scenario 9 — record-build sanitization (Atlas finding 4).
+        # _blocker_record / _error_record must redact reason/error
+        # BEFORE composing signed_message so the persisted artifact is
+        # secret-free even if a caller drift passes str(exc) raw.
+        from supervisor import (  # noqa: PLC0415
+            _blocker_record as _br,
+            _error_record as _er,
+        )
+
+        synth_blocker = _br(
+            phase="addendum_test",
+            reason=f"raw leak attempt: {synthetic_token}",
+        )
+        synth_error = _er(
+            phase="addendum_test",
+            error=f"raw leak attempt: {synthetic_token}",
+        )
+        ok = (
+            synthetic_token not in synth_blocker["reason"]
+            and synthetic_token not in synth_blocker["signed_message"]
+            and synthetic_token not in synth_error["error"]
+            and synthetic_token not in synth_error["signed_message"]
+            and "[REDACTED:openai_api_key]" in synth_blocker["signed_message"]
+            and "[REDACTED:openai_api_key]" in synth_error["signed_message"]
+        )
+        record(
+            "record-build-sanitization",
+            ok,
+            f"blocker_signed_clean={synthetic_token not in synth_blocker['signed_message']}, "
+            f"error_signed_clean={synthetic_token not in synth_error['signed_message']}",
         )
 
     return CLI_EXIT_COMPLETE if not failures else CLI_EXIT_ERRORED
