@@ -14,10 +14,19 @@ Top-level orchestration service:
 
 This module is a **library** — 4.8 owns the polished public CLI
 (`python orchestra.py --directive "..."`). The CLI exposed here
-(`uv run python -m supervisor --dry-run | --directive`) is validation-only.
+(`uv run python -m supervisor --dry-run | --directive | --resume`) is
+validation-only.
+
+SQLite session persistence (task 4.6) is integrated as an opt-in
+parameter (`store=SessionStore(...)`) on `run_supervisor()` and is the
+sole mechanism `resume_supervisor()` uses to continue a crashed or
+in-flight run **in place** under the original `run_id`. Default behavior
+when no store is provided is unchanged from 4.5 — the run is in-memory
+only and the legacy 4.5 surface is preserved byte-for-byte.
+
 This module does NOT implement:
-- SQLite session persistence (task 4.6).
 - MCP tool wiring inside the loop (task 4.7).
+- The polished public CLI on `orchestra.py` (task 4.8).
 - REST API endpoints (task 4.11).
 
 Per the M4 architecture scope (Asana comment 1215386979487630): hooks wrap
@@ -137,9 +146,11 @@ class SupervisorStep:
 class SupervisorRun:
     """In-memory record of one supervisor invocation.
 
-    Persistence is intentionally absent — task 4.6 (SQLite) is the place
-    that will write these to disk. For 4.5 the run lives only in the
-    returning caller's address space.
+    When the run was driven through `run_supervisor(..., store=...)`,
+    the same record is also persisted to SQLite via the 4.6 session
+    store at every phase boundary; this dataclass is then a snapshot
+    of the rehydrated state. Without a store, the run lives only in
+    the returning caller's address space.
     """
 
     run_id: str
@@ -807,8 +818,23 @@ def run_supervisor(
             created_at=_utc_now(),
         )
 
+    # Statuses that represent a finished run lifecycle; non-terminal
+    # statuses (planning/executing/finalizing) describe an in-flight or
+    # crashed run and must NOT carry a completed_at timestamp — Atlas's
+    # 4.6 review (comment 1215454084467171) flagged this as muddying the
+    # operator semantics 4.8/4.11 depend on.
+    _TERMINAL_STATUSES = frozenset(
+        {
+            SUPERVISOR_STATUS_COMPLETE,
+            SUPERVISOR_STATUS_BLOCKED,
+            SUPERVISOR_STATUS_ERRORED,
+            SUPERVISOR_STATUS_PENDING_HUMAN_APPROVAL,
+        }
+    )
+
     def finalize(status: str) -> SupervisorRun:
-        completed_at = _utc_now()
+        is_terminal = status in _TERMINAL_STATUSES
+        completed_at = _utc_now() if is_terminal else None
         if store is not None:
             store.update_session(
                 run_id,
@@ -820,7 +846,8 @@ def run_supervisor(
                     finalizer_envelope.id if finalizer_envelope is not None else None
                 ),
                 plan=plan,
-                completed_at=completed_at,
+                # Only stamp completed_at when the run truly finished.
+                completed_at=completed_at if is_terminal else None,
                 error_count=len(errors),
                 blocker_count=len(blockers),
             )
@@ -1036,142 +1063,409 @@ def resume_supervisor(
     directive: str | None = None,
     dry_run: bool = False,
 ) -> SupervisorRun:
-    """Resume a persisted supervisor run from its `run_id` or `session_id`.
+    """Resume a persisted supervisor run **in place** — same run_id.
 
-    Semantics per Atlas's 4.6 packet §11:
+    Implements the 4.6 directive §11 semantics that the original commit
+    `9640802` missed (Atlas's review at Asana comment 1215454084467171):
 
-    - `complete` / `blocked` / `errored` / `pending_human_approval`:
-      rehydrate and return; never call providers.
-    - `planning` with no planner envelope: re-plan only if the caller
-      passes the original directive (the redacted summary is not safe
-      to re-plan from). Otherwise return a signed Atlas error explaining
-      why resume is unsafe.
-    - `planning` with a planner envelope and a valid plan: resume from
-      the first incomplete planned step.
-    - `executing`: resume from the first incomplete planned step.
-    - `finalizing` (all steps complete, finalizer missing): run the
-      finalizer and persist it.
+    - **Terminal** (complete / blocked / errored / pending_human_approval):
+      rehydrate via `load_supervisor_run` and return. No provider call.
+    - **planning with no planner envelope**:
+      - directive supplied: rerun the planner for the SAME run_id +
+        session_id, persist the planner envelope and plan into the same
+        session, and continue into step execution.
+      - directive missing: persist a signed `resume_unsafe` blocker
+        decision into the same session and return blocked.
+    - **planning / executing with planner envelope + plan + some
+      completed steps**: rehydrate the planned action rows, skip any
+      step already `status=responded` with a response envelope, and
+      execute the remaining steps in order into the same run_id.
+    - **all steps responded, finalizer missing**: run only the
+      finalizer turn into the same run_id, persist it, mark the
+      session complete.
+    - **pending human gate**: do not auto-continue. (The corresponding
+      session state is `pending_human_approval`, which is terminal
+      here; the gate row remains pending until 4.11's resolution API
+      lands.)
 
-    For M4 this is sequential-only; parallel resume is out of scope.
+    M4 is sequential-only; parallel resume is out of scope.
 
     Args:
         identifier: a stored `run_id` or `session_id`.
         store: the SessionStore the run was persisted to.
-        directive: original directive text. Required for any case where
-            providers must be re-invoked (live planner re-plan, live
-            step continuation, live finalizer). Optional for terminal
-            states or dry-run resumes.
-        dry_run: when True, no provider calls are made. The
-            continuation uses the same synthetic-envelope path as
+        directive: original directive text. Required to re-plan a
+            session whose planner envelope is missing. Optional for
+            terminal-state rehydration and step/finalizer continuation
+            (the plan and step messages already on disk are the source
+            of truth there).
+        dry_run: when True, no provider calls are made — continuation
+            uses the same synthetic-envelope path as
             `run_supervisor(dry_run=True)`.
 
     Returns:
-        SupervisorRun: the resumed run's final state.
+        SupervisorRun: the resumed run's final state, persisted in
+        place against the original run_id.
 
     Raises:
         SessionStoreError: when the identifier does not match a stored
             session.
     """
+    from llm.types import MessageEnvelope  # local: avoid top-level cycle
     from session_store import SessionStoreError  # local: kept lightweight
 
+    load_env_file()
     persisted = store.load_session(identifier)
     if persisted is None:
         raise SessionStoreError(
             f"resume_supervisor: no session matching {identifier!r}"
         )
-    terminal = {
+
+    _terminal = {
         SUPERVISOR_STATUS_COMPLETE,
         SUPERVISOR_STATUS_BLOCKED,
         SUPERVISOR_STATUS_ERRORED,
         SUPERVISOR_STATUS_PENDING_HUMAN_APPROVAL,
     }
-    if persisted.status in terminal:
+    if persisted.status in _terminal:
         run = store.load_supervisor_run(identifier)
-        if run is None:  # pragma: no cover - load_session already returned
+        if run is None:  # pragma: no cover
             raise SessionStoreError(
                 f"resume_supervisor: load_supervisor_run({identifier!r}) failed"
             )
         return run
 
-    # For non-terminal states, M4 falls back to in-memory continuation by
-    # creating a fresh `run_supervisor` invocation from the original
-    # directive. Without the directive we cannot safely continue planner
-    # or live step phases.
-    if directive is None:
-        run = store.load_supervisor_run(identifier)
-        signed = sign_action(
-            "Atlas",
-            f"Supervisor blocker [resume_unsafe]: cannot resume run "
-            f"{persisted.run_id} (status={persisted.status}) without the "
-            "original directive; redacted summary is insufficient.",
+    # --- Non-terminal: in-place continuation ----------------------------
+    run_id = persisted.run_id
+    session_id = persisted.session_id
+    max_steps_norm = persisted.max_steps
+
+    blockers: list[dict[str, Any]] = []  # newly produced this resume
+    errors: list[dict[str, Any]] = []
+
+    # Rehydrate any envelopes already on disk.
+    msg_rows = store.load_messages(run_id)
+    msg_by_id = {m["id"]: m for m in msg_rows}
+
+    def _env_from_row(row: dict[str, Any]) -> MessageEnvelope:
+        return MessageEnvelope(
+            id=row["id"],
+            session_id=row["session_id"],
+            sender=row["sender"],
+            target=row["target"],
+            message_type=row["message_type"],
+            content=row["content"],
+            action_surface=row["action_surface"],
+            parent_id=row["parent_id"],
+            metadata=json.loads(row["metadata_json"] or "{}"),
+            created_at=datetime.fromisoformat(
+                row["created_at"].rstrip("Z")
+            ).replace(tzinfo=UTC),
         )
-        # Augment the rehydrated run with a fresh blocker. Because
-        # SupervisorRun is frozen we synthesize a new instance.
-        existing_blockers = list(run.blockers) if run is not None else []
-        existing_blockers.append(
-            {
-                "phase": "resume_unsafe",
-                "reason": "missing original directive",
-                "signed_message": signed,
-                "run_id": persisted.run_id,
-            }
+
+    planner_envelope: MessageEnvelope | None = None
+    if persisted.planner_envelope_id and persisted.planner_envelope_id in msg_by_id:
+        planner_envelope = _env_from_row(msg_by_id[persisted.planner_envelope_id])
+    finalizer_envelope: MessageEnvelope | None = None
+    if persisted.finalizer_envelope_id and persisted.finalizer_envelope_id in msg_by_id:
+        finalizer_envelope = _env_from_row(msg_by_id[persisted.finalizer_envelope_id])
+    plan = persisted.plan
+
+    # --- Persistence helpers (in-place; share run_id/session_id) -------
+    def _persist_envelope(env: MessageEnvelope, *, phase: str) -> None:
+        store.record_message(
+            envelope_id=env.id,
+            run_id=run_id,
+            session_id=session_id,
+            parent_id=env.parent_id,
+            sender=env.sender,
+            target=env.target,
+            message_type=env.message_type,
+            action_surface=env.action_surface,
+            content=env.content,
+            metadata=dict(env.metadata),
+            created_at=env.created_at,
+            phase=phase,
         )
-        store.update_session(
-            persisted.run_id,
-            status=SUPERVISOR_STATUS_BLOCKED,
-            blocker_count=persisted.blocker_count + 1,
-            completed_at=_utc_now(),
-        )
-        # We don't reissue planner/steps; just persist the new blocker.
+
+    def _persist_decision(record: dict[str, Any], *, kind: str) -> None:
+        phase = str(record.get("phase", "unknown"))
+        signed_message = record.get("signed_message")
+        if not isinstance(signed_message, str) or not signed_message:
+            return
+        text = record.get("reason") if kind == DECISION_KIND_BLOCKER else record.get("error")
+        meta = {k: v for k, v in record.items()
+                if k not in {"phase", "reason", "error", "signed_message"}}
         store.record_decision(
-            run_id=persisted.run_id,
-            session_id=persisted.session_id,
-            kind=DECISION_KIND_BLOCKER,
-            phase="resume_unsafe",
-            signed_message=signed,
-            reason_or_error="missing original directive",
-            metadata={"prior_status": persisted.status},
+            run_id=run_id,
+            session_id=session_id,
+            kind=kind,
+            phase=phase,
+            signed_message=signed_message,
+            reason_or_error=str(text) if text is not None else "",
+            metadata=meta,
             created_at=_utc_now(),
+        )
+
+    def _persist_gate_if_pending(record: dict[str, Any]) -> None:
+        if record.get("decision") != "pending-human-approval":
+            return
+        signed_message = record.get("signed_message")
+        if not isinstance(signed_message, str) or not signed_message:
+            return
+        store.record_gate(
+            run_id=run_id,
+            session_id=session_id,
+            step_id=record.get("step_id"),
+            target=str(record.get("target", "unknown")),
+            action_surface=ACTION_SURFACE_HUMAN_APPROVED_ONLY,
+            signed_message=signed_message,
+            metadata={k: v for k, v in record.items() if k != "signed_message"},
+            created_at=_utc_now(),
+        )
+
+    def _finalize_in_place(status: str) -> SupervisorRun:
+        is_terminal = status in _terminal
+        completed_at = _utc_now() if is_terminal else None
+        store.update_session(
+            run_id,
+            status=status,
+            planner_envelope_id=(
+                planner_envelope.id if planner_envelope is not None else None
+            ),
+            finalizer_envelope_id=(
+                finalizer_envelope.id if finalizer_envelope is not None else None
+            ),
+            plan=plan,
+            completed_at=completed_at if is_terminal else None,
+            error_count=persisted.error_count + len(errors),
+            blocker_count=persisted.blocker_count + len(blockers),
         )
         rehydrated = store.load_supervisor_run(identifier)
         if rehydrated is None:  # pragma: no cover
-            raise SessionStoreError("resume_supervisor: re-load failed")
+            raise SessionStoreError(
+                f"resume_supervisor: re-load failed for {identifier!r}"
+            )
         return rehydrated
 
-    # With a directive we re-execute through `run_supervisor`. This is
-    # the conservative M4 choice: a fresh run is started, the previous
-    # session is closed out as `blocked` with a `resume_replayed`
-    # decision so the audit trail shows the original was abandoned at
-    # status N. 4.11 will replace this with a proper continuation API.
-    signed = sign_action(
-        "Atlas",
-        f"Supervisor blocker [resume_replayed]: original run "
-        f"{persisted.run_id} (status={persisted.status}) was replayed by "
-        "resume_supervisor; M4 does not support mid-run continuation, so a "
-        "fresh run is being started.",
-    )
-    store.update_session(
-        persisted.run_id,
-        status=SUPERVISOR_STATUS_BLOCKED,
-        blocker_count=persisted.blocker_count + 1,
-        completed_at=_utc_now(),
-    )
-    store.record_decision(
-        run_id=persisted.run_id,
-        session_id=persisted.session_id,
-        kind=DECISION_KIND_BLOCKER,
-        phase="resume_replayed",
-        signed_message=signed,
-        reason_or_error=f"replayed from status={persisted.status}",
-        metadata={"replayed_into": "new run_id pending"},
-        created_at=_utc_now(),
-    )
-    return run_supervisor(
-        directive,
-        max_steps=persisted.max_steps,
-        dry_run=dry_run,
-        store=store,
-    )
+    # --- Branch: planner envelope or plan missing ----------------------
+    if planner_envelope is None or plan is None:
+        if directive is None:
+            signed = sign_action(
+                "Atlas",
+                f"Supervisor blocker [resume_unsafe]: cannot resume run "
+                f"{run_id} (status={persisted.status}) without the original "
+                "directive; redacted summary is insufficient to safely re-plan.",
+            )
+            record = {
+                "phase": "resume_unsafe",
+                "reason": "missing original directive",
+                "signed_message": signed,
+                "prior_status": persisted.status,
+            }
+            blockers.append(record)
+            _persist_decision(record, kind=DECISION_KIND_BLOCKER)
+            return _finalize_in_place(SUPERVISOR_STATUS_BLOCKED)
+
+        # Re-plan into the same run_id/session_id.
+        secrets_result = check_for_secrets(directive, actor="Atlas")
+        if not secrets_result.allowed:
+            record = _blocker_record(
+                phase="preflight_secrets_check",
+                reason=secrets_result.reason,
+                secret_kinds=list(secrets_result.matches),
+            )
+            blockers.append(record)
+            _persist_decision(record, kind=DECISION_KIND_BLOCKER)
+            return _finalize_in_place(SUPERVISOR_STATUS_BLOCKED)
+
+        try:
+            planner_envelope = _plan_turn(
+                directive, session_id, max_steps_norm, dry_run
+            )
+        except (UnknownAgentError, ProtocolError, MissingEnvError) as exc:
+            record = _error_record(phase="planner_call", error=str(exc))
+            errors.append(record)
+            _persist_decision(record, kind=DECISION_KIND_ERROR)
+            return _finalize_in_place(SUPERVISOR_STATUS_ERRORED)
+        except ImportError as exc:
+            record = _error_record(phase="planner_sdk", error=str(exc))
+            errors.append(record)
+            _persist_decision(record, kind=DECISION_KIND_ERROR)
+            return _finalize_in_place(SUPERVISOR_STATUS_ERRORED)
+        except Exception as exc:  # noqa: BLE001
+            record = _error_record(
+                phase="planner_call", error=f"{type(exc).__name__}: {exc}"
+            )
+            errors.append(record)
+            _persist_decision(record, kind=DECISION_KIND_ERROR)
+            return _finalize_in_place(SUPERVISOR_STATUS_ERRORED)
+
+        _persist_envelope(planner_envelope, phase=PHASE_PLANNER)
+
+        if planner_envelope.message_type == MESSAGE_TYPE_BLOCKER:
+            record = _blocker_record(
+                phase="planner_blocker",
+                reason="planner returned a blocker envelope",
+                envelope_id=planner_envelope.id,
+                planner_envelope_metadata=dict(planner_envelope.metadata),
+            )
+            blockers.append(record)
+            _persist_decision(record, kind=DECISION_KIND_BLOCKER)
+            return _finalize_in_place(SUPERVISOR_STATUS_BLOCKED)
+
+        try:
+            plan = _parse_plan(planner_envelope.content)
+            validated_steps = _validate_plan(plan, max_steps_norm)
+        except PlanError as exc:
+            record = _blocker_record(
+                phase="plan_parse_or_validate",
+                reason=str(exc),
+                planner_envelope_id=planner_envelope.id,
+            )
+            blockers.append(record)
+            _persist_decision(record, kind=DECISION_KIND_BLOCKER)
+            return _finalize_in_place(SUPERVISOR_STATUS_BLOCKED)
+
+        # Persist planned actions for the same run_id.
+        for spec in validated_steps:
+            store.record_action(
+                run_id=run_id,
+                session_id=session_id,
+                step_id=int(spec["id"]),
+                target=spec["target"],
+                action_surface=spec["action_surface"],
+                message=spec["message"],
+                reason=spec["reason"],
+                status=STEP_STATUS_PLANNED,
+            )
+
+    # --- At this point: planner_envelope + plan exist (rehydrated or fresh) ---
+    # Load the canonical action rows (rehydrated state from disk, then any
+    # planned actions just inserted).
+    action_rows = store.load_actions(run_id)
+    # Build step specs ordered by step_id.
+    step_specs = sorted(action_rows, key=lambda a: int(a["step_id"]))
+
+    # Execute steps whose status is not already `responded`.
+    for action in step_specs:
+        step_status = action["status"]
+        if step_status == STEP_STATUS_RESPONDED:
+            continue  # already done — skip; do not re-call provider
+        spec = {
+            "id": int(action["step_id"]),
+            "target": action["target"],
+            "message": action["message"],
+            "action_surface": action["action_surface"],
+            "reason": action["reason"],
+        }
+        new_step = _execute_step(
+            step_spec=spec,
+            session_id=session_id,
+            parent_id=planner_envelope.id,
+            dry_run=dry_run,
+        )
+        if new_step.response_envelope is not None:
+            _persist_envelope(new_step.response_envelope, phase=PHASE_STEP)
+        store.update_action(
+            run_id,
+            new_step.id,
+            status=new_step.status,
+            response_envelope_id=(
+                new_step.response_envelope.id
+                if new_step.response_envelope is not None
+                else None
+            ),
+            completed_at=new_step.completed_at,
+        )
+        if new_step.status == STEP_STATUS_BLOCKED:
+            decision = (
+                new_step.response_envelope.metadata.get("decision")
+                if new_step.response_envelope is not None
+                else None
+            )
+            inner_phase = (
+                new_step.response_envelope.metadata.get("blocker_phase")
+                if new_step.response_envelope is not None
+                else None
+            )
+            step_reason = (
+                new_step.response_envelope.metadata.get("blocker_reason")
+                if new_step.response_envelope is not None
+                else "step blocked"
+            )
+            record = _blocker_record(
+                phase=f"step_{new_step.id}_blocker",
+                reason=step_reason or "step blocked",
+                step_id=new_step.id,
+                target=new_step.target,
+                envelope_id=(
+                    new_step.response_envelope.id
+                    if new_step.response_envelope is not None
+                    else None
+                ),
+                blocker_phase=inner_phase,
+                decision=decision,
+            )
+            blockers.append(record)
+            _persist_decision(record, kind=DECISION_KIND_BLOCKER)
+            _persist_gate_if_pending(record)
+            if decision == "pending-human-approval":
+                return _finalize_in_place(SUPERVISOR_STATUS_PENDING_HUMAN_APPROVAL)
+            return _finalize_in_place(SUPERVISOR_STATUS_BLOCKED)
+        if new_step.status == STEP_STATUS_ERRORED:
+            record = _error_record(
+                phase=f"step_{new_step.id}_error",
+                error="send_message raised during step execution",
+                step_id=new_step.id,
+                target=new_step.target,
+            )
+            errors.append(record)
+            _persist_decision(record, kind=DECISION_KIND_ERROR)
+            return _finalize_in_place(SUPERVISOR_STATUS_ERRORED)
+
+    # --- Finalizer-only path ------------------------------------------
+    if finalizer_envelope is None:
+        # Build rehydrated step tuple for the finalizer prompt transcript.
+        rehydrated_run = store.load_supervisor_run(identifier)
+        rehydrated_steps = (
+            rehydrated_run.steps if rehydrated_run is not None else tuple()
+        )
+        try:
+            finalizer_envelope = _finalize_turn(
+                plan, rehydrated_steps, session_id, planner_envelope.id, dry_run
+            )
+        except (UnknownAgentError, ProtocolError, MissingEnvError) as exc:
+            record = _error_record(phase="finalizer_call", error=str(exc))
+            errors.append(record)
+            _persist_decision(record, kind=DECISION_KIND_ERROR)
+            return _finalize_in_place(SUPERVISOR_STATUS_ERRORED)
+        except ImportError as exc:
+            record = _error_record(phase="finalizer_sdk", error=str(exc))
+            errors.append(record)
+            _persist_decision(record, kind=DECISION_KIND_ERROR)
+            return _finalize_in_place(SUPERVISOR_STATUS_ERRORED)
+        except Exception as exc:  # noqa: BLE001
+            record = _error_record(
+                phase="finalizer_call", error=f"{type(exc).__name__}: {exc}"
+            )
+            errors.append(record)
+            _persist_decision(record, kind=DECISION_KIND_ERROR)
+            return _finalize_in_place(SUPERVISOR_STATUS_ERRORED)
+
+        _persist_envelope(finalizer_envelope, phase=PHASE_FINALIZER)
+
+        if finalizer_envelope.message_type == MESSAGE_TYPE_BLOCKER:
+            record = _blocker_record(
+                phase="finalizer_blocker",
+                reason="finalizer returned a blocker envelope",
+                envelope_id=finalizer_envelope.id,
+                finalizer_envelope_metadata=dict(finalizer_envelope.metadata),
+            )
+            blockers.append(record)
+            _persist_decision(record, kind=DECISION_KIND_BLOCKER)
+            return _finalize_in_place(SUPERVISOR_STATUS_BLOCKED)
+
+    return _finalize_in_place(SUPERVISOR_STATUS_COMPLETE)
 
 
 # --- Dry-run + CLI ----------------------------------------------------------
@@ -1717,95 +2011,197 @@ def _supervisor_dry_run() -> int:
         except Exception as exc:  # noqa: BLE001
             record("persisted-human-approved", False, f"raised {type(exc).__name__}: {exc}")
 
-        # 23. persisted-crash-after-planner → resume completes without duplication
+        # 23. persisted-resume-two-step-in-place — Atlas's targeted proof:
+        # crash after step 1 on a two-step plan; resume completes step 2
+        # in-place under the SAME run_id, leaves step 1 untouched, runs
+        # the finalizer, and marks the original session complete.
         try:
-            store_c1 = fresh_store("crash_planner")
+            two_step_plan = {
+                "summary": "two-step in-place resume",
+                "steps": [
+                    {"id": 1, "target": "Cody", "message": "Step one.",
+                     "action_surface": ACTION_SURFACE_SAFE, "reason": "first"},
+                    {"id": 2, "target": "Cody", "message": "Step two.",
+                     "action_surface": ACTION_SURFACE_SAFE, "reason": "second"},
+                ],
+                "final_response_instruction": "Summarize both steps.",
+            }
+            payload = f"<orchestra_plan>{json.dumps(two_step_plan)}</orchestra_plan>"
+            store_c = fresh_store("two_step")
             run_a = run_supervisor(
-                "Crash-after-planner smoke.",
+                "Two-step in-place resume smoke.",
                 dry_run=True,
-                store=store_c1,
-                _stop_after="planner",
-            )
-            actions_before = store_c1.load_actions(run_a.run_id)
-            msgs_before = store_c1.load_messages(run_a.run_id)
-            # Status should be `planning` after the crash; one planned action
-            # row sits with status=planned; one planner message persisted.
-            crash_ok = (
-                run_a.status == SUPERVISOR_STATUS_PLANNING
-                and len(actions_before) == 1
-                and actions_before[0]["status"] == STEP_STATUS_PLANNED
-                and len(msgs_before) == 1
-            )
-            # M4 resume restarts a fresh run; the original is closed out as
-            # `blocked` with a `resume_replayed` decision and a new
-            # SupervisorRun runs the work to completion.
-            resumed = resume_supervisor(
-                run_a.run_id,
-                store=store_c1,
-                directive="Crash-after-planner smoke.",
-                dry_run=True,
-            )
-            replay_decisions = store_c1.load_decisions(run_a.run_id)
-            ok = (
-                crash_ok
-                and resumed.status == SUPERVISOR_STATUS_COMPLETE
-                and resumed.run_id != run_a.run_id  # fresh run_id
-                and any(
-                    d["phase"] == "resume_replayed" for d in replay_decisions
-                )
-            )
-            record(
-                "persisted-crash-after-planner",
-                ok,
-                f"crash captured at planning; resume completed run={resumed.run_id}"
-                if ok
-                else f"unexpected: crash_status={run_a.status}, resumed={resumed.status}",
-            )
-        except Exception as exc:  # noqa: BLE001
-            record("persisted-crash-after-planner", False, f"raised {type(exc).__name__}: {exc}")
-
-        # 24. persisted-crash-after-step-1 → resume completes without duplicating step 1
-        try:
-            store_c2 = fresh_store("crash_step")
-            run_b = run_supervisor(
-                "Crash-after-step-1 smoke.",
-                dry_run=True,
-                store=store_c2,
+                store=store_c,
+                _dry_run_planner_content=payload,
                 _stop_after="step:1",
             )
-            actions_before = store_c2.load_actions(run_b.run_id)
+            # Crash-row semantics: non-terminal session must have completed_at IS NULL.
+            crash_session = store_c.load_session(run_a.run_id)
+            actions_before = store_c.load_actions(run_a.run_id)
             crash_ok = (
-                run_b.status == SUPERVISOR_STATUS_EXECUTING
-                and len(actions_before) == 1
+                run_a.status == SUPERVISOR_STATUS_EXECUTING
+                and run_a.completed_at is None
+                and crash_session is not None
+                and crash_session.completed_at is None
+                and len(actions_before) == 2
                 and actions_before[0]["status"] == STEP_STATUS_RESPONDED
+                and actions_before[1]["status"] == STEP_STATUS_PLANNED
             )
+            # In-place resume on the SAME run_id.
             resumed = resume_supervisor(
-                run_b.run_id,
-                store=store_c2,
-                directive="Crash-after-step-1 smoke.",
+                run_a.run_id,
+                store=store_c,
+                directive="Two-step in-place resume smoke.",
                 dry_run=True,
             )
-            # Original run rows are not duplicated under the new run; the
-            # new run has its own step rows.
-            orig_actions = store_c2.load_actions(run_b.run_id)
-            new_actions = store_c2.load_actions(resumed.run_id)
+            after_actions = store_c.load_actions(run_a.run_id)
+            decisions = store_c.load_decisions(run_a.run_id)
+            same_run = resumed.run_id == run_a.run_id
+            both_responded = (
+                len(after_actions) == 2
+                and after_actions[0]["status"] == STEP_STATUS_RESPONDED
+                and after_actions[1]["status"] == STEP_STATUS_RESPONDED
+            )
+            # Step 1's response_envelope_id should be unchanged.
+            step1_unchanged = (
+                after_actions[0]["response_envelope_id"]
+                == actions_before[0]["response_envelope_id"]
+            )
+            no_replay = not any(d["phase"] == "resume_replayed" for d in decisions)
             ok = (
                 crash_ok
+                and same_run
                 and resumed.status == SUPERVISOR_STATUS_COMPLETE
-                and resumed.run_id != run_b.run_id
-                and len(orig_actions) == 1  # original step row preserved, untouched
-                and len(new_actions) == 1   # new run has its own row
+                and both_responded
+                and step1_unchanged
+                and no_replay
+                and resumed.finalizer_envelope is not None
             )
             record(
-                "persisted-crash-after-step-1",
+                "persisted-resume-two-step-in-place",
                 ok,
-                f"crash captured at executing; resume completed run={resumed.run_id} with no row duplication"
-                if ok
-                else f"unexpected: crash={run_b.status}, resumed={resumed.status}, "
-                f"orig_actions={len(orig_actions)}, new_actions={len(new_actions)}",
+                f"same_run={same_run}, actions={[a['status'] for a in after_actions]}, "
+                f"step1_unchanged={step1_unchanged}, no_replay={no_replay}, "
+                f"finalizer={resumed.finalizer_envelope.id if resumed.finalizer_envelope else None}",
             )
         except Exception as exc:  # noqa: BLE001
-            record("persisted-crash-after-step-1", False, f"raised {type(exc).__name__}: {exc}")
+            record("persisted-resume-two-step-in-place", False, f"raised {type(exc).__name__}: {exc}")
+
+        # 24. persisted-resume-finalizer-only — single-step crash after step 1
+        # leaves all steps responded but finalizer missing; resume runs ONLY
+        # the finalizer under the same run_id.
+        try:
+            store_f = fresh_store("finalizer_only")
+            run_f = run_supervisor(
+                "Finalizer-only resume smoke.",
+                dry_run=True,
+                store=store_f,
+                _stop_after="step:1",
+            )
+            crash_session = store_f.load_session(run_f.run_id)
+            actions_before = store_f.load_actions(run_f.run_id)
+            msgs_before = store_f.load_messages(run_f.run_id)
+            crash_ok = (
+                run_f.status == SUPERVISOR_STATUS_EXECUTING
+                and crash_session is not None
+                and crash_session.completed_at is None  # non-terminal: completed_at must be None
+                and crash_session.finalizer_envelope_id is None
+                and len(actions_before) == 1
+                and actions_before[0]["status"] == STEP_STATUS_RESPONDED
+                and len(msgs_before) == 2  # planner + step 1
+            )
+            resumed = resume_supervisor(
+                run_f.run_id,
+                store=store_f,
+                directive="Finalizer-only resume smoke.",
+                dry_run=True,
+            )
+            after_session = store_f.load_session(run_f.run_id)
+            after_actions = store_f.load_actions(run_f.run_id)
+            after_msgs = store_f.load_messages(run_f.run_id)
+            step1_unchanged = (
+                len(after_actions) == 1
+                and after_actions[0]["response_envelope_id"]
+                == actions_before[0]["response_envelope_id"]
+            )
+            same_run = resumed.run_id == run_f.run_id
+            ok = (
+                crash_ok
+                and same_run
+                and resumed.status == SUPERVISOR_STATUS_COMPLETE
+                and after_session is not None
+                and after_session.finalizer_envelope_id is not None
+                and after_session.completed_at is not None
+                and step1_unchanged
+                and len(after_msgs) == 3  # planner + step 1 + finalizer (no duplication)
+            )
+            record(
+                "persisted-resume-finalizer-only",
+                ok,
+                f"same_run={same_run}, finalizer_env={after_session.finalizer_envelope_id if after_session else None}, "
+                f"msgs={len(after_msgs)}, step1_unchanged={step1_unchanged}"
+                if ok
+                else f"unexpected: crash_ok={crash_ok}, resumed={resumed.status}, "
+                f"after_actions={[(a['step_id'], a['status']) for a in after_actions]}, "
+                f"after_session.completed_at={after_session.completed_at if after_session else None}, "
+                f"after_session.finalizer={after_session.finalizer_envelope_id if after_session else None}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            record("persisted-resume-finalizer-only", False, f"raised {type(exc).__name__}: {exc}")
+
+        # 25. persisted-resume-unsafe-no-directive — crash with no planner
+        # envelope and no directive on resume produces a signed
+        # `resume_unsafe` blocker and no provider call.
+        try:
+            store_u = fresh_store("unsafe")
+            run_u = run_supervisor(
+                "Unsafe resume smoke.",
+                dry_run=True,
+                store=store_u,
+                _stop_after="planner",
+            )
+            # After planner-stage crash: status=planning, planner_envelope_id IS set,
+            # plan IS persisted. To prove the missing-directive unsafe path,
+            # synthetically clear the planner envelope id + plan on the row so the
+            # resume hits the no-planner branch.
+            with store_u.transaction() as conn:
+                conn.execute(
+                    "UPDATE sessions SET planner_envelope_id = NULL, plan_json = NULL "
+                    "WHERE run_id = ?",
+                    (run_u.run_id,),
+                )
+            crash_session = store_u.load_session(run_u.run_id)
+            crash_ok = (
+                crash_session is not None
+                and crash_session.completed_at is None
+                and crash_session.planner_envelope_id is None
+                and crash_session.plan is None
+            )
+            resumed = resume_supervisor(
+                run_u.run_id,
+                store=store_u,
+                directive=None,  # the key property under test
+                dry_run=True,
+            )
+            decisions = store_u.load_decisions(run_u.run_id)
+            unsafe_decisions = [d for d in decisions if d["phase"] == "resume_unsafe"]
+            ok = (
+                crash_ok
+                and resumed.run_id == run_u.run_id  # same run_id
+                and resumed.status == SUPERVISOR_STATUS_BLOCKED
+                and len(unsafe_decisions) == 1
+                and unsafe_decisions[0]["signed_message"].startswith("[Atlas · ")
+            )
+            record(
+                "persisted-resume-unsafe-no-directive",
+                ok,
+                "signed resume_unsafe blocker persisted on same run_id; no provider call"
+                if ok
+                else f"unexpected: crash_ok={crash_ok}, resumed.status={resumed.status}, "
+                f"unsafe_decisions={unsafe_decisions}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            record("persisted-resume-unsafe-no-directive", False, f"raised {type(exc).__name__}: {exc}")
 
         # 25. persisted-redaction — synthetic token doesn't survive in rows
         try:
@@ -1922,7 +2318,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run the 25 supervisor scenarios (11 unit + 7 signed-halt + 7 persisted) without any provider API call.",
+        help="Run the 26 supervisor scenarios (11 unit + 7 signed-halt + 8 persisted, including 3 in-place resume scenarios) without any provider API call.",
     )
     parser.add_argument(
         "--directive",
