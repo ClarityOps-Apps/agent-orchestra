@@ -818,6 +818,21 @@ def run_supervisor(
     if not isinstance(directive, str):
         raise TypeError("run_supervisor: directive must be a string.")
 
+    # 4.7 step 1 addendum: enforce dry-run-only on the forced-exception
+    # test hooks. The receipt promised live runs ignore them; the code
+    # now makes that strictly true — passing the kwargs on a live run is
+    # rejected at the entry point rather than silently respected.
+    # Atlas review 1215456686905326.
+    if not dry_run and (
+        _force_step_exception is not None or _force_step_target_id is not None
+    ):
+        raise ValueError(
+            "run_supervisor: `_force_step_exception` and "
+            "`_force_step_target_id` are dry-run-only test hooks. "
+            "Set `dry_run=True` to use them; live runs must not force "
+            "synthetic exceptions."
+        )
+
     load_env_file()
     run_id = _new_id()
     session_id = _new_id()
@@ -1241,6 +1256,8 @@ def resume_supervisor(
     store: SessionStore,
     directive: str | None = None,
     dry_run: bool = False,
+    _force_step_exception: BaseException | None = None,
+    _force_step_target_id: int | None = None,
 ) -> SupervisorRun:
     """Resume a persisted supervisor run **in place** — same run_id.
 
@@ -1291,6 +1308,17 @@ def resume_supervisor(
     """
     from llm.types import MessageEnvelope  # local: avoid top-level cycle
     from session_store import SessionStoreError  # local: kept lightweight
+
+    # 4.7 step 1 addendum: same dry-run-only enforcement as run_supervisor.
+    if not dry_run and (
+        _force_step_exception is not None or _force_step_target_id is not None
+    ):
+        raise ValueError(
+            "resume_supervisor: `_force_step_exception` and "
+            "`_force_step_target_id` are dry-run-only test hooks. "
+            "Set `dry_run=True` to use them; live runs must not force "
+            "synthetic exceptions."
+        )
 
     load_env_file()
     persisted = store.load_session(identifier)
@@ -1552,6 +1580,15 @@ def resume_supervisor(
             session_id=session_id,
             parent_id=planner_envelope.id,
             dry_run=dry_run,
+            _force_exception=(
+                _force_step_exception
+                if _force_step_exception is not None
+                and (
+                    _force_step_target_id is None
+                    or _force_step_target_id == int(action["step_id"])
+                )
+                else None
+            ),
         )
         if new_step.response_envelope is not None:
             _persist_envelope(new_step.response_envelope, phase=PHASE_STEP)
@@ -1602,11 +1639,36 @@ def resume_supervisor(
                 return _finalize_in_place(SUPERVISOR_STATUS_PENDING_HUMAN_APPROVAL)
             return _finalize_in_place(SUPERVISOR_STATUS_BLOCKED)
         if new_step.status == STEP_STATUS_ERRORED:
+            # Mirror run_supervisor()'s step-error consumption (4.7 step 1
+            # addendum): preserve `new_step.error_info` so a resumed
+            # step that hits a provider transient (anthropic 529 / openai
+            # 429) is persisted under phase=step_{N}_provider_transient
+            # with exception_class + error_kind metadata, not the generic
+            # step_{N}_error line. Atlas review 1215456686905326.
+            info = new_step.error_info or {}
+            kind = str(info.get("kind", "runtime"))
+            exc_class = info.get("exception_class")
+            exc_message = info.get("message")
+            if exc_class:
+                error_text = (
+                    f"step {new_step.id} {kind} error from {new_step.target} "
+                    f"({exc_class}): {exc_message}"
+                )
+                phase = (
+                    f"step_{new_step.id}_provider_transient"
+                    if kind == "transient_provider"
+                    else f"step_{new_step.id}_error"
+                )
+            else:
+                error_text = "send_message raised during step execution"
+                phase = f"step_{new_step.id}_error"
             record = _error_record(
-                phase=f"step_{new_step.id}_error",
-                error="send_message raised during step execution",
+                phase=phase,
+                error=error_text,
                 step_id=new_step.id,
                 target=new_step.target,
+                exception_class=exc_class,
+                error_kind=kind,
             )
             errors.append(record)
             _persist_decision(record, kind=DECISION_KIND_ERROR)
@@ -2518,6 +2580,180 @@ def _supervisor_dry_run() -> int:
             f"raised {type(exc).__name__}: {exc}",
         )
 
+    # 28. persisted-resume-provider-transient-step — 4.7 step 1 addendum:
+    # prove the SAME provider-transient classification works in the resume
+    # path (Atlas review 1215456686905326). Two-step plan, crash after
+    # step 1, resume with forced OverloadedError on step 2. Asserts:
+    #   - status=errored
+    #   - signed decision row phase=step_2_provider_transient (same run_id)
+    #   - exception_class=OverloadedError, error_kind=transient_provider
+    #   - resume preserves same_run = True
+    try:
+        import anthropic  # noqa: PLC0415
+
+        overload_cls = getattr(anthropic, "OverloadedError", None)
+        if overload_cls is None:
+            try:
+                from anthropic import _exceptions as _anth_exc  # noqa: PLC0415
+            except ImportError:
+                _anth_exc = None  # type: ignore[assignment]
+            if _anth_exc is not None:
+                overload_cls = getattr(_anth_exc, "OverloadedError", None)
+        if overload_cls is None:
+            record(
+                "persisted-resume-provider-transient-step",
+                False,
+                "anthropic.OverloadedError not importable from top-level or _exceptions; skipping",
+            )
+        else:
+            two_step_plan = {
+                "summary": "resume transient",
+                "steps": [
+                    {"id": 1, "target": "Cody", "message": "ok step",
+                     "action_surface": ACTION_SURFACE_SAFE, "reason": "first"},
+                    {"id": 2, "target": "Cody", "message": "transient step",
+                     "action_surface": ACTION_SURFACE_SAFE, "reason": "second"},
+                ],
+                "final_response_instruction": "Summarize.",
+            }
+            payload = (
+                f"<orchestra_plan>{json.dumps(two_step_plan)}</orchestra_plan>"
+            )
+            store_rt = SessionStore(tmp_path / "resume_transient.db")
+            crashed = run_supervisor(
+                "Resume transient smoke.",
+                dry_run=True,
+                store=store_rt,
+                _dry_run_planner_content=payload,
+                _stop_after="step:1",
+            )
+            synthetic = overload_cls.__new__(overload_cls)
+            synthetic.args = ("simulated 529 during resumed step 2",)
+            resumed = resume_supervisor(
+                crashed.run_id,
+                store=store_rt,
+                directive="Resume transient smoke.",
+                dry_run=True,
+                _force_step_exception=synthetic,
+                _force_step_target_id=2,
+            )
+            decisions = store_rt.load_decisions(crashed.run_id)
+            transient_decisions = [
+                d
+                for d in decisions
+                if d["phase"] == "step_2_provider_transient"
+            ]
+            try:
+                meta = (
+                    json.loads(transient_decisions[0]["metadata_json"])
+                    if transient_decisions
+                    else {}
+                )
+            except (json.JSONDecodeError, KeyError):
+                meta = {}
+            same_run = resumed.run_id == crashed.run_id
+            ok = (
+                same_run
+                and resumed.status == SUPERVISOR_STATUS_ERRORED
+                and len(transient_decisions) == 1
+                and transient_decisions[0]["signed_message"].startswith("[Atlas · ")
+                and meta.get("exception_class") == "OverloadedError"
+                and meta.get("error_kind") == "transient_provider"
+            )
+            record(
+                "persisted-resume-provider-transient-step",
+                ok,
+                f"same_run={same_run}, status={resumed.status}, "
+                f"signed step_2_provider_transient decision with "
+                f"exception_class=OverloadedError, kind=transient_provider"
+                if ok
+                else f"unexpected: same_run={same_run}, status={resumed.status}, "
+                f"transient_decisions={transient_decisions}, meta={meta}",
+            )
+    except ImportError:
+        record(
+            "persisted-resume-provider-transient-step",
+            False,
+            "anthropic SDK not installed; skipping",
+        )
+    except Exception as exc:  # noqa: BLE001
+        record(
+            "persisted-resume-provider-transient-step",
+            False,
+            f"raised {type(exc).__name__}: {exc}",
+        )
+
+    # 29. force-hook-rejected-on-live — 4.7 step 1 addendum: prove the
+    # private forced-exception hook is rejected on live runs. Verifies
+    # that even if a caller passes the private kwarg, dry_run=False
+    # makes the call fail closed before any provider call.
+    try:
+        synthetic = Exception("simulated")
+        run_supervisor(
+            "Live forced-hook smoke.",
+            dry_run=False,
+            _force_step_exception=synthetic,
+        )
+        record(
+            "force-hook-rejected-on-live",
+            False,
+            "live run with _force_step_exception did NOT raise ValueError",
+        )
+    except ValueError as exc:
+        ok = "dry-run-only" in str(exc)
+        record(
+            "force-hook-rejected-on-live",
+            ok,
+            "ValueError raised on live force-hook usage as expected"
+            if ok
+            else f"unexpected ValueError text: {exc}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        record(
+            "force-hook-rejected-on-live",
+            False,
+            f"raised {type(exc).__name__} (expected ValueError): {exc}",
+        )
+
+    # 30. force-hook-rejected-on-live-resume — same enforcement on resume.
+    try:
+        # Build any persisted session quickly to give resume a target.
+        store_l = SessionStore(tmp_path / "force_live.db")
+        crashed_l = run_supervisor(
+            "force-hook-rejected-on-live-resume seed.",
+            dry_run=True,
+            store=store_l,
+            _stop_after="planner",
+        )
+        synthetic = Exception("simulated")
+        resume_supervisor(
+            crashed_l.run_id,
+            store=store_l,
+            directive="seed",
+            dry_run=False,
+            _force_step_exception=synthetic,
+        )
+        record(
+            "force-hook-rejected-on-live-resume",
+            False,
+            "live resume with _force_step_exception did NOT raise ValueError",
+        )
+    except ValueError as exc:
+        ok = "dry-run-only" in str(exc)
+        record(
+            "force-hook-rejected-on-live-resume",
+            ok,
+            "ValueError raised on live resume force-hook usage as expected"
+            if ok
+            else f"unexpected ValueError text: {exc}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        record(
+            "force-hook-rejected-on-live-resume",
+            False,
+            f"raised {type(exc).__name__} (expected ValueError): {exc}",
+        )
+
     for case in passes:
         print(sign_action("Cody", f"supervisor dry-run pass — {case}"))
     for case in failures:
@@ -2596,7 +2832,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run the 27 supervisor scenarios (11 unit + 7 signed-halt + 9 persisted, including 3 in-place resume and 1 provider-transient) without any provider API call.",
+        help="Run the 30 supervisor scenarios (11 unit + 7 signed-halt + 10 persisted including resume + 2 force-hook dry-run-only guards) without any provider API call.",
     )
     parser.add_argument(
         "--directive",
