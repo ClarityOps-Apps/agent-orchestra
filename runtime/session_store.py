@@ -65,7 +65,13 @@ from hooks.secrets_check import find_secrets, redact
 #: Schema version managed by both ``PRAGMA user_version`` and the
 #: ``schema_migrations`` bookkeeping table. Bump when the schema changes
 #: and add a migration in ``_MIGRATIONS``.
-SCHEMA_VERSION = 1
+#:
+#: v1 (4.6): sessions / messages / actions / gates / decisions.
+#: v2 (4.7): adds ``tool_calls`` table for supervisor-mediated MCP/tool
+#:           access. Existing v1 databases auto-upgrade on first
+#:           ``ensure_schema()`` call via the ``IF NOT EXISTS`` DDL plus
+#:           a ``PRAGMA user_version`` bump.
+SCHEMA_VERSION = 2
 
 #: Runtime root (one level up from this file). Default DB path lives at
 #: ``runtime/memory/sessions.db``, already covered by the
@@ -109,6 +115,22 @@ GATE_STATUS_APPROVED = "approved"
 GATE_STATUS_REJECTED = "rejected"
 VALID_GATE_STATUSES: frozenset[str] = frozenset(
     {GATE_STATUS_PENDING, GATE_STATUS_APPROVED, GATE_STATUS_REJECTED}
+)
+
+#: Tool-call lifecycle states. Mirrors ``runtime.tool_registry``'s
+#: ``VALID_TOOL_STATUSES``; we duplicate the literals here to keep the
+#: persistence layer importable without pulling in the registry module.
+TOOL_STATUS_OK = "ok"
+TOOL_STATUS_BLOCKED = "blocked"
+TOOL_STATUS_ERRORED = "errored"
+TOOL_STATUS_PENDING_HUMAN_APPROVAL = "pending-human-approval"
+VALID_TOOL_STATUSES: frozenset[str] = frozenset(
+    {
+        TOOL_STATUS_OK,
+        TOOL_STATUS_BLOCKED,
+        TOOL_STATUS_ERRORED,
+        TOOL_STATUS_PENDING_HUMAN_APPROVAL,
+    }
 )
 
 
@@ -217,16 +239,44 @@ _SCHEMA_DDL: tuple[str, ...] = (
         FOREIGN KEY (run_id) REFERENCES sessions(run_id) ON DELETE CASCADE
     )
     """,
+    # 4.7 — supervisor-mediated MCP/tool call persistence. ``args_json`` and
+    # ``result_summary`` are already redacted before insert; the table holds
+    # only signed/redacted artifacts. ``signed_message`` is required and
+    # enforced via ``enforce_signed()`` at the write boundary.
+    """
+    CREATE TABLE IF NOT EXISTS tool_calls (
+        tool_call_id     TEXT NOT NULL PRIMARY KEY,
+        run_id           TEXT NOT NULL,
+        session_id       TEXT NOT NULL,
+        step_id          INTEGER,
+        agent            TEXT NOT NULL,
+        tool_name        TEXT NOT NULL,
+        server_name      TEXT NOT NULL,
+        action_surface   TEXT NOT NULL,
+        status           TEXT NOT NULL,
+        args_json        TEXT NOT NULL,
+        result_summary   TEXT NOT NULL,
+        signed_message   TEXT NOT NULL,
+        error            TEXT,
+        started_at       TEXT NOT NULL,
+        completed_at     TEXT NOT NULL,
+        metadata_json    TEXT NOT NULL,
+        FOREIGN KEY (run_id) REFERENCES sessions(run_id) ON DELETE CASCADE
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_gates_status ON gates(status, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_decisions_session_created ON decisions(session_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_tool_calls_session_started ON tool_calls(session_id, started_at)",
+    "CREATE INDEX IF NOT EXISTS idx_tool_calls_status ON tool_calls(status, started_at)",
 )
 
 
 _MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, "initial schema: sessions, messages, actions, gates, decisions"),
+    (2, "tool_calls table for supervisor-mediated MCP/tool access (4.7)"),
 )
 
 
@@ -764,6 +814,82 @@ class SessionStore:
             )
         return decision_id
 
+    # --- writes: tool_calls ------------------------------------------------
+
+    def record_tool_call(
+        self,
+        *,
+        tool_call_id: str,
+        run_id: str,
+        session_id: str,
+        step_id: int | None,
+        agent: str,
+        tool_name: str,
+        server_name: str,
+        action_surface: str,
+        status: str,
+        args_json: str,
+        result_summary: str,
+        signed_message: str,
+        error: str | None,
+        started_at: str,
+        completed_at: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """Insert one tool-call row produced by ``tool_registry.execute_tool``.
+
+        Every column other than ``error`` is required. ``args_json`` and
+        ``result_summary`` arrive already redacted from the registry; we
+        re-run ``redact()`` defensively here as belt-and-suspenders so a
+        secret-shaped token cannot survive even if the registry's redaction
+        layer ever drifts. ``signed_message`` is checked with
+        ``enforce_signed()`` so an unsigned line cannot land in the table.
+
+        Returns the ``tool_call_id`` so callers can confirm round-trip.
+        """
+        if status not in VALID_TOOL_STATUSES:
+            raise SessionStoreError(
+                f"record_tool_call: unknown status {status!r}; "
+                f"valid {sorted(VALID_TOOL_STATUSES)}"
+            )
+        enforce_signed(signed_message)
+        # Timestamps arrive as ISO-Z strings already (the registry stamps
+        # them with the same ``_utc_now_iso`` helper this module uses); we
+        # accept them verbatim rather than reparsing them through
+        # ``_iso()`` so the registry's exact value persists.
+        safe_args = _safe_text(args_json) or ""
+        safe_summary = _safe_text(result_summary) or ""
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO tool_calls (
+                    tool_call_id, run_id, session_id, step_id, agent,
+                    tool_name, server_name, action_surface, status,
+                    args_json, result_summary, signed_message, error,
+                    started_at, completed_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    tool_call_id,
+                    run_id,
+                    session_id,
+                    int(step_id) if step_id is not None else None,
+                    agent,
+                    tool_name,
+                    server_name,
+                    action_surface,
+                    status,
+                    safe_args,
+                    safe_summary,
+                    signed_message,
+                    _safe_text(error),
+                    started_at,
+                    completed_at,
+                    _dump_metadata(metadata or {}),
+                ),
+            )
+        return tool_call_id
+
     # --- reads --------------------------------------------------------------
 
     def _resolve_run_id(self, conn: sqlite3.Connection, identifier: str) -> str | None:
@@ -859,6 +985,19 @@ class SessionStore:
                 return []
             rows = conn.execute(
                 "SELECT * FROM decisions WHERE run_id = ? ORDER BY created_at ASC",
+                (run_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def load_tool_calls(self, identifier: str) -> list[dict[str, Any]]:
+        """Return all tool_call rows for a run, oldest first."""
+        with self.connection() as conn:
+            run_id = self._resolve_run_id(conn, identifier)
+            if run_id is None:
+                return []
+            rows = conn.execute(
+                "SELECT * FROM tool_calls WHERE run_id = ? "
+                "ORDER BY started_at ASC, tool_call_id ASC",
                 (run_id,),
             ).fetchall()
         return [dict(r) for r in rows]
@@ -1237,7 +1376,170 @@ def _self_test() -> int:
         except Exception as exc:  # noqa: BLE001
             record("load-supervisor-run", False, f"{type(exc).__name__}: {exc}")
 
-        # 13. ORCHESTRA_SESSIONS_DB env override
+        # 13a. Tool-call round-trip (4.7 schema v2): signed-message
+        # enforcement, redaction on args/summary, FK to sessions.
+        try:
+            tool_call_id = str(uuid4())
+            tc_started = _utc_now_iso()
+            signed_tc = sign_action("Cody", "Tool ok: asana.get_task self-test")
+            store.record_tool_call(
+                tool_call_id=tool_call_id,
+                run_id=run_id,
+                session_id=session_id,
+                step_id=1,
+                agent="Cody",
+                tool_name="asana.get_task",
+                server_name="asana",
+                action_surface="safe",
+                status=TOOL_STATUS_OK,
+                args_json='{"task_id":"1215386977640867"}',
+                result_summary="dry-run synthetic ok",
+                signed_message=signed_tc,
+                error=None,
+                started_at=tc_started,
+                completed_at=tc_started,
+                metadata={"dry_run": True},
+            )
+            tool_calls = store.load_tool_calls(run_id)
+            ok = (
+                len(tool_calls) == 1
+                and tool_calls[0]["tool_call_id"] == tool_call_id
+                and tool_calls[0]["status"] == TOOL_STATUS_OK
+                and tool_calls[0]["signed_message"] == signed_tc
+                and tool_calls[0]["agent"] == "Cody"
+                and tool_calls[0]["tool_name"] == "asana.get_task"
+            )
+            record(
+                "tool-call-roundtrip",
+                ok,
+                f"tool_calls={len(tool_calls)}, "
+                f"status={tool_calls[0]['status'] if tool_calls else None}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            record("tool-call-roundtrip", False, f"{type(exc).__name__}: {exc}")
+
+        # 13b. Tool-call rejects unsigned signed_message.
+        try:
+            store.record_tool_call(
+                tool_call_id=str(uuid4()),
+                run_id=run_id,
+                session_id=session_id,
+                step_id=2,
+                agent="Cody",
+                tool_name="asana.get_task",
+                server_name="asana",
+                action_surface="safe",
+                status=TOOL_STATUS_OK,
+                args_json="{}",
+                result_summary="should fail",
+                signed_message="this is not signed",
+                error=None,
+                started_at=_utc_now_iso(),
+                completed_at=_utc_now_iso(),
+                metadata={},
+            )
+            record(
+                "tool-call-rejects-unsigned",
+                False,
+                "did NOT raise SignatureError",
+            )
+        except Exception as exc:  # noqa: BLE001
+            record(
+                "tool-call-rejects-unsigned",
+                "SignatureError" in type(exc).__name__,
+                f"raised {type(exc).__name__}",
+            )
+
+        # 13c. Tool-call redaction proof: synthetic secret in args/summary
+        # must not survive in either column after the write.
+        try:
+            secret_token = "sk-proj-BBBBBBBBBBBBBBBBBBBB"
+            tc2_id = str(uuid4())
+            tc2_started = _utc_now_iso()
+            store.record_tool_call(
+                tool_call_id=tc2_id,
+                run_id=run_id,
+                session_id=session_id,
+                step_id=3,
+                agent="Cody",
+                tool_name="asana.add_comment",
+                server_name="asana",
+                action_surface="guarded",
+                status=TOOL_STATUS_OK,
+                args_json=f'{{"text":"please use {secret_token}"}}',
+                result_summary=f"raw {secret_token} leaked",
+                signed_message=sign_action(
+                    "Cody", "Tool ok: asana.add_comment redaction test"
+                ),
+                error=f"trace mentions {secret_token}",
+                started_at=tc2_started,
+                completed_at=tc2_started,
+                metadata={"leak": secret_token},
+            )
+            row = next(
+                (r for r in store.load_tool_calls(run_id)
+                 if r["tool_call_id"] == tc2_id),
+                None,
+            )
+            ok = row is not None and all(
+                secret_token not in (row[col] or "")
+                for col in (
+                    "args_json",
+                    "result_summary",
+                    "error",
+                    "metadata_json",
+                )
+            )
+            record(
+                "tool-call-redaction",
+                ok,
+                f"row_present={row is not None}; raw_token_survived="
+                f"{row is not None and any(secret_token in (row[c] or '') for c in ('args_json','result_summary','error','metadata_json'))}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            record("tool-call-redaction", False, f"{type(exc).__name__}: {exc}")
+
+        # 13d. v1→v2 migration on an existing v1 DB. Build a fresh DB at
+        # user_version=1 with the v1 DDL only, then call ensure_schema and
+        # confirm we land at user_version=2 with tool_calls present.
+        try:
+            v1_db = Path(tmp) / "legacy_v1.db"
+            legacy_conn = sqlite3.connect(v1_db, isolation_level=None)
+            try:
+                # Apply every DDL that is NOT part of the v2 tool_calls
+                # surface. Content-based filter rather than slicing so the
+                # check survives further DDL additions.
+                for v1_ddl in _SCHEMA_DDL:
+                    if "tool_calls" in v1_ddl:
+                        continue
+                    legacy_conn.execute(v1_ddl)
+                legacy_conn.execute("PRAGMA user_version = 1")
+            finally:
+                legacy_conn.close()
+
+            legacy_store = SessionStore(v1_db)
+            applied = legacy_store.ensure_schema()
+            tables = {
+                r[0]
+                for r in legacy_store._connect().execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            ok = (
+                applied == SCHEMA_VERSION
+                and "tool_calls" in tables
+                and legacy_store.schema_version() == SCHEMA_VERSION
+            )
+            record(
+                "v1-to-v2-migration",
+                ok,
+                f"applied={applied}, tool_calls_present={'tool_calls' in tables}, "
+                f"user_version={legacy_store.schema_version()}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            record("v1-to-v2-migration", False, f"{type(exc).__name__}: {exc}")
+
+        # 14. ORCHESTRA_SESSIONS_DB env override
         try:
             env_tmp = Path(tmp) / "env_override.db"
             previous = os.environ.get(ORCHESTRA_SESSIONS_DB_ENV)

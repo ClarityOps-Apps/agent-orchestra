@@ -77,6 +77,18 @@ from session_store import (
     PHASE_STEP,
     SessionStore,
 )
+from tool_registry import (
+    TOOL_REGISTRY,
+    TOOL_STATUS_BLOCKED,
+    TOOL_STATUS_ERRORED,
+    TOOL_STATUS_OK,
+    TOOL_STATUS_PENDING_HUMAN_APPROVAL,
+    ToolCallResult,
+    UnknownToolError,
+    allowed_tools_for,
+    execute_tool,
+    is_agent_allowed,
+)
 
 
 # --- Constants ---------------------------------------------------------------
@@ -493,6 +505,43 @@ def _validate_plan(plan: dict[str, Any], max_steps: int) -> list[dict[str, Any]]
         reason = raw["reason"]
         if not isinstance(reason, str):
             raise PlanError(f"Step {step_id} reason must be a string.")
+        # 4.7 main scope: optional `tool_calls` on a step. Each entry must
+        # be `{tool_name: str, args: object}`. The tool name must be in
+        # the registry; the agent (canonical_target) must be permitted to
+        # use the tool. Validation here keeps the supervisor's policy
+        # surface fail-closed before any provider/executor call.
+        tool_calls_raw = raw.get("tool_calls", [])
+        if not isinstance(tool_calls_raw, list):
+            raise PlanError(
+                f"Step {step_id} tool_calls must be a list of objects."
+            )
+        validated_tool_calls: list[dict[str, Any]] = []
+        for tc_idx, tc in enumerate(tool_calls_raw, start=1):
+            if not isinstance(tc, dict):
+                raise PlanError(
+                    f"Step {step_id} tool_calls[{tc_idx}] must be a JSON object."
+                )
+            tc_tool = tc.get("tool_name")
+            if not isinstance(tc_tool, str) or not tc_tool:
+                raise PlanError(
+                    f"Step {step_id} tool_calls[{tc_idx}] missing string `tool_name`."
+                )
+            if tc_tool not in TOOL_REGISTRY:
+                raise PlanError(
+                    f"Step {step_id} tool_calls[{tc_idx}] unknown tool {tc_tool!r}; "
+                    f"registered: {sorted(TOOL_REGISTRY)}."
+                )
+            tc_args = tc.get("args", {})
+            if not isinstance(tc_args, dict):
+                raise PlanError(
+                    f"Step {step_id} tool_calls[{tc_idx}] args must be a JSON object."
+                )
+            if not is_agent_allowed(canonical_target, tc_tool):
+                raise PlanError(
+                    f"Step {step_id} tool_calls[{tc_idx}]: agent "
+                    f"{canonical_target} is not authorized for {tc_tool}."
+                )
+            validated_tool_calls.append({"tool_name": tc_tool, "args": tc_args})
         normalized.append(
             {
                 "id": step_id,
@@ -500,6 +549,7 @@ def _validate_plan(plan: dict[str, Any], max_steps: int) -> list[dict[str, Any]]
                 "message": message,
                 "action_surface": action_surface,
                 "reason": reason,
+                "tool_calls": validated_tool_calls,
             }
         )
     return normalized
@@ -1100,6 +1150,102 @@ def run_supervisor(
 
     # --- Step execution -------------------------------------------------------
     for step_spec in validated_steps:
+        # 4.7 main scope: run any pre-step tool calls through the registry
+        # before dispatching the subagent message. Each tool call is
+        # already validated against agent/tool permissions in
+        # `_validate_plan`; the registry re-checks at execute_tool() as
+        # defense-in-depth and applies the full hook chain
+        # (secrets → approval → execute → sign → persist).
+        tool_summaries: list[str] = []
+        tool_halt = False
+        for tc in step_spec.get("tool_calls", []):
+            tool_result = execute_tool(
+                step_spec["target"],
+                tc["tool_name"],
+                tc["args"],
+                run_id=run_id,
+                session_id=session_id,
+                step_id=int(step_spec["id"]),
+                store=store,
+                dry_run=dry_run,
+            )
+            tool_summaries.append(
+                f"  - {tool_result.tool_name} ({tool_result.action_surface}) "
+                f"→ {tool_result.status}: {tool_result.result_summary[:200]}"
+            )
+            if tool_result.status == TOOL_STATUS_OK:
+                continue
+            # Any non-ok outcome halts the supervisor with a signed
+            # blocker/error decision. The tool_call row itself is already
+            # persisted by execute_tool(); we add a matching decision
+            # (and gate row when pending-human-approval) so the existing
+            # decisions/gates surface 4.8/4.11 consumes stays uniform.
+            if tool_result.status == TOOL_STATUS_PENDING_HUMAN_APPROVAL:
+                record = _blocker_record(
+                    phase=f"step_{step_spec['id']}_tool_pending_human_approval",
+                    reason=tool_result.result_summary or "tool gated for human approval",
+                    step_id=int(step_spec["id"]),
+                    target=step_spec["target"],
+                    tool_name=tool_result.tool_name,
+                    tool_call_id=tool_result.tool_call_id,
+                    decision="pending-human-approval",
+                    signed_message=tool_result.signed_message,
+                )
+                blockers.append(record)
+                _persist_decision(record, kind=DECISION_KIND_BLOCKER)
+                _persist_gate_if_pending(record)
+                tool_halt = True
+                final_status = SUPERVISOR_STATUS_PENDING_HUMAN_APPROVAL
+                break
+            if tool_result.status == TOOL_STATUS_BLOCKED:
+                record = _blocker_record(
+                    phase=f"step_{step_spec['id']}_tool_blocked",
+                    reason=tool_result.result_summary or "tool blocked by hook chain",
+                    step_id=int(step_spec["id"]),
+                    target=step_spec["target"],
+                    tool_name=tool_result.tool_name,
+                    tool_call_id=tool_result.tool_call_id,
+                    signed_message=tool_result.signed_message,
+                )
+                blockers.append(record)
+                _persist_decision(record, kind=DECISION_KIND_BLOCKER)
+                tool_halt = True
+                final_status = SUPERVISOR_STATUS_BLOCKED
+                break
+            # TOOL_STATUS_ERRORED
+            record = _error_record(
+                phase=f"step_{step_spec['id']}_tool_errored",
+                error=tool_result.error or tool_result.result_summary
+                or "tool executor errored",
+                step_id=int(step_spec["id"]),
+                target=step_spec["target"],
+                tool_name=tool_result.tool_name,
+                tool_call_id=tool_result.tool_call_id,
+                signed_message=tool_result.signed_message,
+            )
+            errors.append(record)
+            _persist_decision(record, kind=DECISION_KIND_ERROR)
+            tool_halt = True
+            final_status = SUPERVISOR_STATUS_ERRORED
+            break
+
+        if tool_halt:
+            return finalize(final_status)
+
+        # If any tool calls succeeded, fold a redacted signed-summary block
+        # into the subagent's message so the LLM sees the tool outputs in
+        # context. The summaries are already redacted by the registry.
+        if tool_summaries and step_spec.get("tool_calls"):
+            tool_block = "\n".join(
+                [
+                    "<orchestra_tool_results>",
+                    *tool_summaries,
+                    "</orchestra_tool_results>",
+                ]
+            )
+            step_spec = dict(step_spec)
+            step_spec["message"] = step_spec["message"] + "\n\n" + tool_block
+
         step = _execute_step(
             step_spec=step_spec,
             session_id=session_id,
@@ -1563,6 +1709,17 @@ def resume_supervisor(
     # Build step specs ordered by step_id.
     step_specs = sorted(action_rows, key=lambda a: int(a["step_id"]))
 
+    # Build a step_id → plan_step lookup so we can rehydrate tool_calls
+    # for any not-yet-responded step. The plan JSON is the authoritative
+    # source; `actions` rows don't carry tool_calls.
+    plan_steps_by_id: dict[int, dict[str, Any]] = {}
+    if isinstance(plan, dict):
+        for s in plan.get("steps", []) or []:
+            try:
+                plan_steps_by_id[int(s["id"])] = s
+            except (KeyError, TypeError, ValueError):
+                continue
+
     # Execute steps whose status is not already `responded`.
     for action in step_specs:
         step_status = action["status"]
@@ -1575,6 +1732,102 @@ def resume_supervisor(
             "action_surface": action["action_surface"],
             "reason": action["reason"],
         }
+        plan_step = plan_steps_by_id.get(int(action["step_id"]))
+        rehydrated_tool_calls: list[dict[str, Any]] = []
+        if isinstance(plan_step, dict):
+            for tc in plan_step.get("tool_calls", []) or []:
+                if (
+                    isinstance(tc, dict)
+                    and isinstance(tc.get("tool_name"), str)
+                    and tc["tool_name"] in TOOL_REGISTRY
+                    and isinstance(tc.get("args", {}), dict)
+                    and is_agent_allowed(spec["target"], tc["tool_name"])
+                ):
+                    rehydrated_tool_calls.append(
+                        {"tool_name": tc["tool_name"], "args": tc.get("args", {})}
+                    )
+        # 4.7 main scope: replay tool calls on resume too. Same hook chain.
+        tool_summaries: list[str] = []
+        tool_halt = False
+        for tc in rehydrated_tool_calls:
+            tool_result = execute_tool(
+                spec["target"],
+                tc["tool_name"],
+                tc["args"],
+                run_id=run_id,
+                session_id=session_id,
+                step_id=int(spec["id"]),
+                store=store,
+                dry_run=dry_run,
+            )
+            tool_summaries.append(
+                f"  - {tool_result.tool_name} ({tool_result.action_surface}) "
+                f"→ {tool_result.status}: {tool_result.result_summary[:200]}"
+            )
+            if tool_result.status == TOOL_STATUS_OK:
+                continue
+            if tool_result.status == TOOL_STATUS_PENDING_HUMAN_APPROVAL:
+                record = _blocker_record(
+                    phase=f"step_{spec['id']}_tool_pending_human_approval",
+                    reason=tool_result.result_summary
+                    or "tool gated for human approval",
+                    step_id=int(spec["id"]),
+                    target=spec["target"],
+                    tool_name=tool_result.tool_name,
+                    tool_call_id=tool_result.tool_call_id,
+                    decision="pending-human-approval",
+                    signed_message=tool_result.signed_message,
+                )
+                blockers.append(record)
+                _persist_decision(record, kind=DECISION_KIND_BLOCKER)
+                _persist_gate_if_pending(record)
+                tool_halt = True
+                resume_tool_halt_status = SUPERVISOR_STATUS_PENDING_HUMAN_APPROVAL
+                break
+            if tool_result.status == TOOL_STATUS_BLOCKED:
+                record = _blocker_record(
+                    phase=f"step_{spec['id']}_tool_blocked",
+                    reason=tool_result.result_summary
+                    or "tool blocked by hook chain",
+                    step_id=int(spec["id"]),
+                    target=spec["target"],
+                    tool_name=tool_result.tool_name,
+                    tool_call_id=tool_result.tool_call_id,
+                    signed_message=tool_result.signed_message,
+                )
+                blockers.append(record)
+                _persist_decision(record, kind=DECISION_KIND_BLOCKER)
+                tool_halt = True
+                resume_tool_halt_status = SUPERVISOR_STATUS_BLOCKED
+                break
+            record = _error_record(
+                phase=f"step_{spec['id']}_tool_errored",
+                error=tool_result.error
+                or tool_result.result_summary
+                or "tool executor errored",
+                step_id=int(spec["id"]),
+                target=spec["target"],
+                tool_name=tool_result.tool_name,
+                tool_call_id=tool_result.tool_call_id,
+                signed_message=tool_result.signed_message,
+            )
+            errors.append(record)
+            _persist_decision(record, kind=DECISION_KIND_ERROR)
+            tool_halt = True
+            resume_tool_halt_status = SUPERVISOR_STATUS_ERRORED
+            break
+        if tool_halt:
+            return _finalize_in_place(resume_tool_halt_status)
+        if tool_summaries:
+            tool_block = "\n".join(
+                [
+                    "<orchestra_tool_results>",
+                    *tool_summaries,
+                    "</orchestra_tool_results>",
+                ]
+            )
+            spec["message"] = spec["message"] + "\n\n" + tool_block
+
         new_step = _execute_step(
             step_spec=spec,
             session_id=session_id,
@@ -2754,6 +3007,294 @@ def _supervisor_dry_run() -> int:
             f"raised {type(exc).__name__} (expected ValueError): {exc}",
         )
 
+    # --- 4.7 main scope: supervisor + tool registry integration -------------
+    # Each scenario drives a full run_supervisor(..., dry_run=True, store=...)
+    # whose plan carries tool_calls on a step. The full hook chain
+    # (permission → surface → secrets → approval → execute → sign →
+    # persist) runs, and the supervisor halt path / message-folding /
+    # tool_call row persistence are all asserted.
+    import os  # noqa: PLC0415 - local: only needed for the ORCHESTRA_ROOT toggling here
+
+    def _plan_with_tool_calls(
+        target: str,
+        tool_calls: list[dict[str, Any]],
+        *,
+        action_surface: str = ACTION_SURFACE_SAFE,
+    ) -> dict[str, Any]:
+        return {
+            "summary": "supervisor+tools scenario",
+            "steps": [
+                {
+                    "id": 1,
+                    "target": target,
+                    "message": "Acknowledge tool results.",
+                    "action_surface": action_surface,
+                    "reason": "supervisor+tools scenario step",
+                    "tool_calls": tool_calls,
+                }
+            ],
+            "final_response_instruction": "Summarize the tool outputs.",
+        }
+
+    # 31. plan-tool-calls-validate-unknown-tool: planner emits a tool_call
+    # for an unregistered tool. _validate_plan refuses.
+    try:
+        bad_plan = _plan_with_tool_calls(
+            "Cody",
+            [{"tool_name": "bogus.thing", "args": {}}],
+        )
+        payload = f"<orchestra_plan>{json.dumps(bad_plan)}</orchestra_plan>"
+        run_t = run_supervisor(
+            "tool calls scenario",
+            dry_run=True,
+            _dry_run_planner_content=payload,
+        )
+        ok = (
+            run_t.status == SUPERVISOR_STATUS_BLOCKED
+            and len(run_t.blockers) == 1
+            and run_t.blockers[0]["phase"] == "plan_parse_or_validate"
+            and "unknown tool" in run_t.blockers[0]["reason"]
+        )
+        record(
+            "plan-tool-calls-validate-unknown-tool",
+            ok,
+            f"status={run_t.status}, blockers={[b.get('phase') for b in run_t.blockers]}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        record(
+            "plan-tool-calls-validate-unknown-tool",
+            False,
+            f"raised {type(exc).__name__}: {exc}",
+        )
+
+    # 32. plan-tool-calls-validate-unauthorized-agent: Scribe attempts
+    # github.get_repo. _validate_plan refuses.
+    try:
+        bad_plan = _plan_with_tool_calls(
+            "Scribe",
+            [
+                {
+                    "tool_name": "github.get_repo",
+                    "args": {"owner": "ClarityOps-Apps", "repo": "agent-orchestra"},
+                }
+            ],
+        )
+        payload = f"<orchestra_plan>{json.dumps(bad_plan)}</orchestra_plan>"
+        run_t = run_supervisor(
+            "tool calls scenario",
+            dry_run=True,
+            _dry_run_planner_content=payload,
+        )
+        ok = (
+            run_t.status == SUPERVISOR_STATUS_BLOCKED
+            and "not authorized" in (run_t.blockers[0]["reason"] if run_t.blockers else "")
+        )
+        record(
+            "plan-tool-calls-validate-unauthorized-agent",
+            ok,
+            f"status={run_t.status}, reason={(run_t.blockers[0]['reason'] if run_t.blockers else None)}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        record(
+            "plan-tool-calls-validate-unauthorized-agent",
+            False,
+            f"raised {type(exc).__name__}: {exc}",
+        )
+
+    # 33. supervisor-tool-call-ok-persisted: Cody runs filesystem.read_file
+    # on a synthetic file under ORCHESTRA_ROOT; tool_call row is persisted
+    # and the run completes with status=complete.
+    try:
+        with tempfile.TemporaryDirectory(prefix="sv-tool-ok-") as t:
+            os.environ["ORCHESTRA_ROOT"] = t
+            try:
+                # Seed a target file inside the root.
+                target_file = Path(t) / "scratch.txt"
+                target_file.write_text("hello", encoding="utf-8")
+                good_plan = _plan_with_tool_calls(
+                    "Cody",
+                    [
+                        {
+                            "tool_name": "filesystem.read_file",
+                            "args": {"path": str(target_file)},
+                        }
+                    ],
+                )
+                payload = f"<orchestra_plan>{json.dumps(good_plan)}</orchestra_plan>"
+                store_ok = SessionStore(Path(t) / "sessions.db")
+                run_t = run_supervisor(
+                    "tool calls scenario",
+                    dry_run=True,
+                    store=store_ok,
+                    _dry_run_planner_content=payload,
+                )
+                tool_calls = store_ok.load_tool_calls(run_t.run_id)
+                ok = (
+                    run_t.status == SUPERVISOR_STATUS_COMPLETE
+                    and len(tool_calls) == 1
+                    and tool_calls[0]["status"] == "ok"
+                    and tool_calls[0]["tool_name"] == "filesystem.read_file"
+                    and tool_calls[0]["signed_message"].startswith("[Cody · ")
+                )
+                record(
+                    "supervisor-tool-call-ok-persisted",
+                    ok,
+                    f"status={run_t.status}, tool_calls={len(tool_calls)}, "
+                    f"row_status={tool_calls[0]['status'] if tool_calls else None}",
+                )
+            finally:
+                os.environ.pop("ORCHESTRA_ROOT", None)
+    except Exception as exc:  # noqa: BLE001
+        record(
+            "supervisor-tool-call-ok-persisted",
+            False,
+            f"raised {type(exc).__name__}: {exc}",
+        )
+
+    # 34. supervisor-tool-call-secrets-block: Cody supplies a secret-shaped
+    # token in tool args. Hook chain blocks before execution; tool_call row
+    # status=blocked; supervisor halts with status=blocked.
+    try:
+        os.environ.setdefault("ORCHESTRA_ROOT", str(Path(__file__).resolve().parent))
+        secret = "sk-proj-CCCCCCCCCCCCCCCCCCCC"
+        bad_plan = _plan_with_tool_calls(
+            "Cody",
+            [
+                {
+                    "tool_name": "asana.add_comment",
+                    "args": {"task_id": "123", "text": f"please use {secret}"},
+                }
+            ],
+            action_surface=ACTION_SURFACE_SAFE,
+        )
+        payload = f"<orchestra_plan>{json.dumps(bad_plan)}</orchestra_plan>"
+        with tempfile.TemporaryDirectory(prefix="sv-tool-sec-") as t:
+            store_sec = SessionStore(Path(t) / "sessions.db")
+            run_t = run_supervisor(
+                "tool calls scenario",
+                dry_run=True,
+                store=store_sec,
+                _dry_run_planner_content=payload,
+            )
+            tool_calls = store_sec.load_tool_calls(run_t.run_id)
+            ok = (
+                run_t.status == SUPERVISOR_STATUS_BLOCKED
+                and len(tool_calls) == 1
+                and tool_calls[0]["status"] == "blocked"
+                and secret not in (tool_calls[0]["args_json"] or "")
+                and secret not in (tool_calls[0]["signed_message"] or "")
+            )
+            record(
+                "supervisor-tool-call-secrets-block",
+                ok,
+                f"status={run_t.status}, "
+                f"row_status={tool_calls[0]['status'] if tool_calls else None}, "
+                f"raw_secret_survived="
+                f"{tool_calls and secret in (tool_calls[0]['args_json'] or '')}",
+            )
+    except Exception as exc:  # noqa: BLE001
+        record(
+            "supervisor-tool-call-secrets-block",
+            False,
+            f"raised {type(exc).__name__}: {exc}",
+        )
+
+    # 35. supervisor-tool-call-human-approved-pending: Cody attempts
+    # github.push_branch (human-approved-only). Supervisor halts as
+    # pending_human_approval; gate row + decision row + tool_call row
+    # all present, no live execution.
+    try:
+        plan35 = _plan_with_tool_calls(
+            "Cody",
+            [
+                {
+                    "tool_name": "github.push_branch",
+                    "args": {"branch": "main"},
+                }
+            ],
+        )
+        payload = f"<orchestra_plan>{json.dumps(plan35)}</orchestra_plan>"
+        with tempfile.TemporaryDirectory(prefix="sv-tool-gate-") as t:
+            store_g = SessionStore(Path(t) / "sessions.db")
+            run_t = run_supervisor(
+                "tool calls scenario",
+                dry_run=True,
+                store=store_g,
+                _dry_run_planner_content=payload,
+            )
+            tool_calls = store_g.load_tool_calls(run_t.run_id)
+            gates = store_g.load_gates(run_t.run_id)
+            decisions = store_g.load_decisions(run_t.run_id)
+            ok = (
+                run_t.status == SUPERVISOR_STATUS_PENDING_HUMAN_APPROVAL
+                and len(tool_calls) == 1
+                and tool_calls[0]["status"] == "pending-human-approval"
+                and len(gates) == 1
+                and gates[0]["action_surface"] == "human-approved-only"
+                and any(
+                    d["phase"].endswith("_tool_pending_human_approval")
+                    for d in decisions
+                )
+            )
+            record(
+                "supervisor-tool-call-human-approved-pending",
+                ok,
+                f"status={run_t.status}, gates={len(gates)}, "
+                f"decisions={[d['phase'] for d in decisions]}",
+            )
+    except Exception as exc:  # noqa: BLE001
+        record(
+            "supervisor-tool-call-human-approved-pending",
+            False,
+            f"raised {type(exc).__name__}: {exc}",
+        )
+
+    # 36. supervisor-tool-call-fs-deny-blocked: Cody attempts
+    # filesystem.read_file on a deny-listed path (.env). Hook chain blocks
+    # before any FS open; tool_call row=blocked, supervisor halt=blocked.
+    try:
+        with tempfile.TemporaryDirectory(prefix="sv-tool-fsdeny-") as t:
+            os.environ["ORCHESTRA_ROOT"] = t
+            try:
+                plan36 = _plan_with_tool_calls(
+                    "Cody",
+                    [
+                        {
+                            "tool_name": "filesystem.read_file",
+                            "args": {"path": f"{t}/.env"},
+                        }
+                    ],
+                )
+                payload = f"<orchestra_plan>{json.dumps(plan36)}</orchestra_plan>"
+                store_fd = SessionStore(Path(t) / "sessions.db")
+                run_t = run_supervisor(
+                    "tool calls scenario",
+                    dry_run=True,
+                    store=store_fd,
+                    _dry_run_planner_content=payload,
+                )
+                tool_calls = store_fd.load_tool_calls(run_t.run_id)
+                ok = (
+                    run_t.status == SUPERVISOR_STATUS_BLOCKED
+                    and len(tool_calls) == 1
+                    and tool_calls[0]["status"] == "blocked"
+                    and "deny pattern" in (tool_calls[0]["result_summary"] or "")
+                )
+                record(
+                    "supervisor-tool-call-fs-deny-blocked",
+                    ok,
+                    f"status={run_t.status}, "
+                    f"row_summary={(tool_calls[0]['result_summary'][:80] if tool_calls else None)}",
+                )
+            finally:
+                os.environ.pop("ORCHESTRA_ROOT", None)
+    except Exception as exc:  # noqa: BLE001
+        record(
+            "supervisor-tool-call-fs-deny-blocked",
+            False,
+            f"raised {type(exc).__name__}: {exc}",
+        )
+
     for case in passes:
         print(sign_action("Cody", f"supervisor dry-run pass — {case}"))
     for case in failures:
@@ -2832,7 +3373,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run the 30 supervisor scenarios (11 unit + 7 signed-halt + 10 persisted including resume + 2 force-hook dry-run-only guards) without any provider API call.",
+        help="Run the 36 supervisor scenarios (11 unit + 7 signed-halt + 10 persisted including resume + 2 force-hook guards + 6 tool-registry integration) without any provider API call.",
     )
     parser.add_argument(
         "--directive",

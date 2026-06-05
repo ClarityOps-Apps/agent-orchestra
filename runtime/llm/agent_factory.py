@@ -287,9 +287,22 @@ def dry_run() -> int:
 
 
 def list_agents() -> int:
-    """Emit one signed spec line per agent. No env / SDK checks."""
+    """Emit one signed spec line per agent. No env / SDK checks.
+
+    The 4.7 directive requires this CLI to surface the per-agent allowed_tools
+    matrix. The matrix lives in ``runtime.tool_registry`` (the single source of
+    truth) and is resolved lazily here to avoid a circular import: factory →
+    registry, registry → factory's ``_canonicalize``.
+    """
+    try:
+        from tool_registry import allowed_tools_for  # noqa: PLC0415
+    except ImportError:  # pragma: no cover - registry should be present
+        allowed_tools_for = None  # type: ignore[assignment]
     for spec in list_specs():
-        tools_repr = list(spec.allowed_tools)
+        if allowed_tools_for is not None:
+            tools_repr = list(allowed_tools_for(spec.name))
+        else:
+            tools_repr = list(spec.allowed_tools)
         policy_repr = spec.hook_policy if spec.hook_policy else {}
         print(
             sign_action(
