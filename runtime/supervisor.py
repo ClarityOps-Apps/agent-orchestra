@@ -51,7 +51,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from config import MissingEnvError, load_env_file
@@ -96,6 +96,12 @@ from tool_registry import (
 DEFAULT_MAX_STEPS = 5
 HARD_CAP_MAX_STEPS = 10
 DIRECTIVE_SUMMARY_LIMIT = 200
+#: 4.8 — upper bound on a single CLI event-feed line. Existing signed
+#: artifacts (envelope content, ToolCallResult.signed_message,
+#: blocker/error signed_message) are sliced to this length before the
+#: event_sink is called, so the operator console doesn't get a full
+#: provider response or a multi-page subagent transcript on one line.
+EVENT_LINE_MAX_CHARS = 800
 PLAN_BLOCK_RE = re.compile(
     r"<orchestra_plan>\s*(\{.*?\})\s*</orchestra_plan>", re.DOTALL
 )
@@ -821,6 +827,7 @@ def run_supervisor(
     max_steps: int = DEFAULT_MAX_STEPS,
     dry_run: bool = False,
     store: SessionStore | None = None,
+    event_sink: Callable[[str], None] | None = None,
     _dry_run_planner_content: str | None = None,
     _stop_after: str | None = None,
     _force_step_exception: BaseException | None = None,
@@ -1057,6 +1064,36 @@ def run_supervisor(
             dry_run=dry_run,
         )
 
+    # --- Event sink helper (4.8 CLI live feed) -------------------------------
+    # The CLI in orchestra.py wires an event_sink that flushes each line
+    # to stdout as it is emitted, so the operator sees signed activity
+    # while the run is in flight (rather than waiting for _format_run()
+    # at the end). When event_sink is None (the existing supervisor
+    # library/dry-run callers), all emit calls become no-ops and behavior
+    # is byte-for-byte unchanged.
+    def _emit(signed: str | None) -> None:
+        if event_sink is None or not signed:
+            return
+        # Defensive redact + length cap. Existing signed artifacts
+        # (envelope.content, ToolCallResult.signed_message, blocker/error
+        # signed_message) are already redacted by their producers, but
+        # belt-and-suspenders here means even a future producer drift
+        # cannot leak a secret-shaped substring to the operator console.
+        capped = signed if len(signed) <= EVENT_LINE_MAX_CHARS else (
+            signed[:EVENT_LINE_MAX_CHARS] + "…[truncated]"
+        )
+        event_sink(redact(capped))
+
+    def _emit_atlas(message: str) -> None:
+        """Sign a synthetic CLI status line as Atlas and emit it."""
+        _emit(sign_action("Atlas", message))
+
+    _emit_atlas(
+        f"Supervisor start: run_id={run_id} session_id={session_id} "
+        f"dry_run={dry_run} max_steps={max_steps_norm} "
+        f"directive_summary={directive_summary[:80]}"
+    )
+
     # --- Pre-flight: secrets check on the directive ---------------------------
     secrets_result = check_for_secrets(directive, actor="Atlas")
     if not secrets_result.allowed:
@@ -1067,9 +1104,11 @@ def run_supervisor(
         )
         blockers.append(record)
         _persist_decision(record, kind=DECISION_KIND_BLOCKER)
+        _emit(record.get("signed_message"))
         return finalize(SUPERVISOR_STATUS_BLOCKED)
 
     # --- Planner turn ---------------------------------------------------------
+    _emit_atlas("Planner start.")
     try:
         planner_envelope = _plan_turn(
             directive,
@@ -1082,11 +1121,13 @@ def run_supervisor(
         record = _error_record(phase="planner_call", error=str(exc))
         errors.append(record)
         _persist_decision(record, kind=DECISION_KIND_ERROR)
+        _emit(record.get("signed_message"))
         return finalize(SUPERVISOR_STATUS_ERRORED)
     except ImportError as exc:
         record = _error_record(phase="planner_sdk", error=str(exc))
         errors.append(record)
         _persist_decision(record, kind=DECISION_KIND_ERROR)
+        _emit(record.get("signed_message"))
         return finalize(SUPERVISOR_STATUS_ERRORED)
     except TRANSIENT_PROVIDER_ERRORS as exc:
         # 4.7 step 1: wrap provider transient errors so a 529 or 429 never
@@ -1099,6 +1140,7 @@ def run_supervisor(
         )
         errors.append(record)
         _persist_decision(record, kind=DECISION_KIND_ERROR)
+        _emit(record.get("signed_message"))
         return finalize(SUPERVISOR_STATUS_ERRORED)
     except Exception as exc:  # noqa: BLE001 - last-resort: don't surface raw traceback
         record = _error_record(
@@ -1106,9 +1148,11 @@ def run_supervisor(
         )
         errors.append(record)
         _persist_decision(record, kind=DECISION_KIND_ERROR)
+        _emit(record.get("signed_message"))
         return finalize(SUPERVISOR_STATUS_ERRORED)
 
     _persist_envelope(planner_envelope, phase=PHASE_PLANNER)
+    _emit(planner_envelope.content)
 
     if planner_envelope.message_type == MESSAGE_TYPE_BLOCKER:
         record = _blocker_record(
@@ -1119,6 +1163,7 @@ def run_supervisor(
         )
         blockers.append(record)
         _persist_decision(record, kind=DECISION_KIND_BLOCKER)
+        _emit(record.get("signed_message"))
         return finalize(SUPERVISOR_STATUS_BLOCKED)
 
     # --- Plan parse + validate -----------------------------------------------
@@ -1133,9 +1178,14 @@ def run_supervisor(
         )
         blockers.append(record)
         _persist_decision(record, kind=DECISION_KIND_BLOCKER)
+        _emit(record.get("signed_message"))
         return finalize(SUPERVISOR_STATUS_BLOCKED)
 
     _persist_planned_actions(validated_steps)
+    _emit_atlas(
+        f"Plan validated: {len(validated_steps)} step(s); "
+        f"targets={[s['target'] for s in validated_steps]}"
+    )
     if _stop_after == "planner":
         # Crash simulation: pretend the process died right after the
         # planner phase persisted. Status remains `planning` so resume
@@ -1174,6 +1224,7 @@ def run_supervisor(
                 f"  - {tool_result.tool_name} ({tool_result.action_surface}) "
                 f"→ {tool_result.status}: {tool_result.result_summary[:200]}"
             )
+            _emit(tool_result.signed_message)
             if tool_result.status == TOOL_STATUS_OK:
                 continue
             # Any non-ok outcome halts the supervisor with a signed
@@ -1231,6 +1282,10 @@ def run_supervisor(
             break
 
         if tool_halt:
+            _emit_atlas(
+                f"Supervisor halting on tool call: step_id={step_spec['id']} "
+                f"status={final_status}"
+            )
             return finalize(final_status)
 
         # 4.7 addendum (Asana 1215461539268696) finding 4 — resume idempotency
@@ -1280,6 +1335,13 @@ def run_supervisor(
         )
         steps.append(step)
         _persist_step_result(step)
+        if step.response_envelope is not None:
+            _emit(step.response_envelope.content)
+        else:
+            _emit_atlas(
+                f"Step {step.id} ({step.target}) status={step.status} "
+                f"(no response envelope)"
+            )
         if step.status == STEP_STATUS_BLOCKED:
             decision = (
                 step.response_envelope.metadata.get("decision")
@@ -1312,6 +1374,7 @@ def run_supervisor(
             blockers.append(record)
             _persist_decision(record, kind=DECISION_KIND_BLOCKER)
             _persist_gate_if_pending(record)
+            _emit(record.get("signed_message"))
             if decision == "pending-human-approval":
                 return finalize(SUPERVISOR_STATUS_PENDING_HUMAN_APPROVAL)
             return finalize(SUPERVISOR_STATUS_BLOCKED)
@@ -1347,6 +1410,7 @@ def run_supervisor(
             )
             errors.append(record)
             _persist_decision(record, kind=DECISION_KIND_ERROR)
+            _emit(record.get("signed_message"))
             return finalize(SUPERVISOR_STATUS_ERRORED)
         if _stop_after == f"step:{step.id}":
             # Crash simulation: process died after persisting this step's
@@ -1361,6 +1425,7 @@ def run_supervisor(
             return finalize(SUPERVISOR_STATUS_EXECUTING)
 
     # --- Finalizer turn ------------------------------------------------------
+    _emit_atlas("Finalizer start.")
     try:
         finalizer_envelope = _finalize_turn(
             plan, tuple(steps), session_id, planner_envelope.id, dry_run
@@ -1369,11 +1434,13 @@ def run_supervisor(
         record = _error_record(phase="finalizer_call", error=str(exc))
         errors.append(record)
         _persist_decision(record, kind=DECISION_KIND_ERROR)
+        _emit(record.get("signed_message"))
         return finalize(SUPERVISOR_STATUS_ERRORED)
     except ImportError as exc:
         record = _error_record(phase="finalizer_sdk", error=str(exc))
         errors.append(record)
         _persist_decision(record, kind=DECISION_KIND_ERROR)
+        _emit(record.get("signed_message"))
         return finalize(SUPERVISOR_STATUS_ERRORED)
     except TRANSIENT_PROVIDER_ERRORS as exc:
         # 4.7 step 1: wrap provider transient errors for the finalizer too.
@@ -1385,6 +1452,7 @@ def run_supervisor(
         )
         errors.append(record)
         _persist_decision(record, kind=DECISION_KIND_ERROR)
+        _emit(record.get("signed_message"))
         return finalize(SUPERVISOR_STATUS_ERRORED)
     except Exception as exc:  # noqa: BLE001
         record = _error_record(
@@ -1392,9 +1460,11 @@ def run_supervisor(
         )
         errors.append(record)
         _persist_decision(record, kind=DECISION_KIND_ERROR)
+        _emit(record.get("signed_message"))
         return finalize(SUPERVISOR_STATUS_ERRORED)
 
     _persist_envelope(finalizer_envelope, phase=PHASE_FINALIZER)
+    _emit(finalizer_envelope.content)
 
     if finalizer_envelope.message_type == MESSAGE_TYPE_BLOCKER:
         record = _blocker_record(
@@ -1405,8 +1475,10 @@ def run_supervisor(
         )
         blockers.append(record)
         _persist_decision(record, kind=DECISION_KIND_BLOCKER)
+        _emit(record.get("signed_message"))
         return finalize(SUPERVISOR_STATUS_BLOCKED)
 
+    _emit_atlas(f"Supervisor complete: run_id={run_id}")
     return finalize(SUPERVISOR_STATUS_COMPLETE)
 
 
@@ -1419,6 +1491,7 @@ def resume_supervisor(
     store: SessionStore,
     directive: str | None = None,
     dry_run: bool = False,
+    event_sink: Callable[[str], None] | None = None,
     _force_step_exception: BaseException | None = None,
     _force_step_target_id: int | None = None,
 ) -> SupervisorRun:
@@ -1484,6 +1557,19 @@ def resume_supervisor(
         )
 
     load_env_file()
+
+    # 4.8 — event sink (same shape as run_supervisor). No-op when None.
+    def _emit(signed: str | None) -> None:
+        if event_sink is None or not signed:
+            return
+        capped = signed if len(signed) <= EVENT_LINE_MAX_CHARS else (
+            signed[:EVENT_LINE_MAX_CHARS] + "…[truncated]"
+        )
+        event_sink(redact(capped))
+
+    def _emit_atlas(message: str) -> None:
+        _emit(sign_action("Atlas", message))
+
     persisted = store.load_session(identifier)
     if persisted is None:
         raise SessionStoreError(
@@ -1502,12 +1588,20 @@ def resume_supervisor(
             raise SessionStoreError(
                 f"resume_supervisor: load_supervisor_run({identifier!r}) failed"
             )
+        _emit_atlas(
+            f"Resume terminal-state rehydrate: run_id={run.run_id} "
+            f"status={run.status}; no provider call."
+        )
         return run
 
     # --- Non-terminal: in-place continuation ----------------------------
     run_id = persisted.run_id
     session_id = persisted.session_id
     max_steps_norm = persisted.max_steps
+    _emit_atlas(
+        f"Resume in-place: run_id={run_id} session_id={session_id} "
+        f"prior_status={persisted.status} dry_run={dry_run}"
+    )
 
     blockers: list[dict[str, Any]] = []  # newly produced this resume
     errors: list[dict[str, Any]] = []
@@ -1859,6 +1953,7 @@ def resume_supervisor(
                 f"  - {tool_result.tool_name} ({tool_result.action_surface}) "
                 f"→ {tool_result.status}: {tool_result.result_summary[:200]}"
             )
+            _emit(tool_result.signed_message)
             if tool_result.status == TOOL_STATUS_OK:
                 continue
             if tool_result.status == TOOL_STATUS_PENDING_HUMAN_APPROVAL:
@@ -1940,6 +2035,12 @@ def resume_supervisor(
         )
         if new_step.response_envelope is not None:
             _persist_envelope(new_step.response_envelope, phase=PHASE_STEP)
+            _emit(new_step.response_envelope.content)
+        else:
+            _emit_atlas(
+                f"Resumed step {new_step.id} ({new_step.target}) "
+                f"status={new_step.status} (no response envelope)"
+            )
         store.update_action(
             run_id,
             new_step.id,
@@ -1983,6 +2084,7 @@ def resume_supervisor(
             blockers.append(record)
             _persist_decision(record, kind=DECISION_KIND_BLOCKER)
             _persist_gate_if_pending(record)
+            _emit(record.get("signed_message"))
             if decision == "pending-human-approval":
                 return _finalize_in_place(SUPERVISOR_STATUS_PENDING_HUMAN_APPROVAL)
             return _finalize_in_place(SUPERVISOR_STATUS_BLOCKED)
@@ -2020,6 +2122,7 @@ def resume_supervisor(
             )
             errors.append(record)
             _persist_decision(record, kind=DECISION_KIND_ERROR)
+            _emit(record.get("signed_message"))
             return _finalize_in_place(SUPERVISOR_STATUS_ERRORED)
 
     # --- Finalizer-only path ------------------------------------------
@@ -2029,6 +2132,7 @@ def resume_supervisor(
         rehydrated_steps = (
             rehydrated_run.steps if rehydrated_run is not None else tuple()
         )
+        _emit_atlas("Resume finalizer start.")
         try:
             finalizer_envelope = _finalize_turn(
                 plan, rehydrated_steps, session_id, planner_envelope.id, dry_run
@@ -2062,6 +2166,7 @@ def resume_supervisor(
             return _finalize_in_place(SUPERVISOR_STATUS_ERRORED)
 
         _persist_envelope(finalizer_envelope, phase=PHASE_FINALIZER)
+        _emit(finalizer_envelope.content)
 
         if finalizer_envelope.message_type == MESSAGE_TYPE_BLOCKER:
             record = _blocker_record(
@@ -2072,8 +2177,10 @@ def resume_supervisor(
             )
             blockers.append(record)
             _persist_decision(record, kind=DECISION_KIND_BLOCKER)
+            _emit(record.get("signed_message"))
             return _finalize_in_place(SUPERVISOR_STATUS_BLOCKED)
 
+    _emit_atlas(f"Supervisor resume complete: run_id={run_id}")
     return _finalize_in_place(SUPERVISOR_STATUS_COMPLETE)
 
 

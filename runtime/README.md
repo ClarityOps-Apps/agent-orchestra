@@ -2,7 +2,47 @@
 
 Phase 1 runtime scaffold for Agent Orchestra.
 
-Day 1 proves the skeleton:
+## Operator CLI — `python orchestra.py --directive "..."` (M4 4.8)
+
+Polished operator entry point. Routes through `runtime/supervisor.py` (`run_supervisor` + `resume_supervisor`) and persists every run via `SessionStore` (4.6 schema v2 with the 4.7 `tool_calls` table). Each phase boundary emits a signed activity line in real time via the `event_sink` callback wired into the supervisor.
+
+Common shapes:
+
+```bash
+# Orchestrated run, default DB at runtime/memory/sessions.db.
+uv run python orchestra.py --directive "Ask Cody to acknowledge the 4.8 smoke."
+
+# Dry-run — full hook + persistence chain, no provider calls.
+uv run python orchestra.py --directive "Ask Cody to acknowledge." --dry-run
+
+# Custom DB path + step budget.
+uv run python orchestra.py --directive "..." --max-steps 3 --db-path /tmp/orchestra.db
+
+# Resume an existing run_id or session_id (terminal-state rehydrate prints
+# the stored run; in-flight resume re-runs only the missing phases).
+uv run python orchestra.py --resume <run_id_or_session_id> --db-path /tmp/orchestra.db
+```
+
+### Exit codes
+
+| Code | Meaning                                  | Run statuses                                  |
+|------|------------------------------------------|-----------------------------------------------|
+| `0`  | Complete                                 | `complete`                                    |
+| `10` | Operator action required (not a crash)   | `blocked`, `pending_human_approval`           |
+| `1`  | Errored or unexpected runtime failure    | `errored` and any unknown state               |
+
+The final signed line names the exit category (`complete` / `operator-action-required` / `errored`). When exit is `10`, every persisted blocker/error line and a resume hint are printed before the CLI returns.
+
+### Inspecting persisted runs
+
+```bash
+uv run python -m session_store --list-sessions
+uv run python -m session_store --show <run_id_or_session_id>
+```
+
+### Legacy positional smoke
+
+Preserved unchanged for M2/M3/M4 receipts. Runs the no-op Atlas+Cody hook flow without contacting any provider:
 
 ```bash
 python orchestra.py "hello team"
@@ -10,7 +50,14 @@ python orchestra.py "hello team"
 
 Expected result: signed log entries from Atlas and Cody, plus lifecycle entries in `memory/activity.log`.
 
-No real model or MCP calls are made on Day 1. API credentials belong in `.env` on the target machine and are never committed.
+No real model or MCP calls are made on the legacy path. API credentials belong in `.env` on the target machine and are never committed.
+
+### Lifecycle flags (unchanged)
+
+```bash
+python orchestra.py --self-test           # hook smoke checks
+python orchestra.py --daemon --interval N # long-lived heartbeat (systemd unit)
+```
 
 ## VPS deployment prerequisite — `uv`
 
