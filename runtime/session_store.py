@@ -243,12 +243,20 @@ _SCHEMA_DDL: tuple[str, ...] = (
     # ``result_summary`` are already redacted before insert; the table holds
     # only signed/redacted artifacts. ``signed_message`` is required and
     # enforced via ``enforce_signed()`` at the write boundary.
+    #
+    # ``step_call_index`` is the planner-assigned 0-based index of this
+    # tool call within its step's ``tool_calls`` list. It exists so the
+    # resume path can deterministically locate a prior row for the same
+    # logical call — without it, a crash after a successful tool call but
+    # before the step's action row updates could cause resume to
+    # re-execute the same tool (Atlas addendum 1215461539268696 finding 4).
     """
     CREATE TABLE IF NOT EXISTS tool_calls (
         tool_call_id     TEXT NOT NULL PRIMARY KEY,
         run_id           TEXT NOT NULL,
         session_id       TEXT NOT NULL,
         step_id          INTEGER,
+        step_call_index  INTEGER NOT NULL DEFAULT 0,
         agent            TEXT NOT NULL,
         tool_name        TEXT NOT NULL,
         server_name      TEXT NOT NULL,
@@ -271,6 +279,9 @@ _SCHEMA_DDL: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_decisions_session_created ON decisions(session_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_tool_calls_session_started ON tool_calls(session_id, started_at)",
     "CREATE INDEX IF NOT EXISTS idx_tool_calls_status ON tool_calls(status, started_at)",
+    # Used by ``load_tool_call_for_step`` on the resume path to look up
+    # idempotency keys without scanning the whole table.
+    "CREATE INDEX IF NOT EXISTS idx_tool_calls_resume_key ON tool_calls(run_id, step_id, step_call_index)",
 )
 
 
@@ -835,6 +846,7 @@ class SessionStore:
         started_at: str,
         completed_at: str,
         metadata: dict[str, Any] | None = None,
+        step_call_index: int = 0,
     ) -> str:
         """Insert one tool-call row produced by ``tool_registry.execute_tool``.
 
@@ -863,17 +875,19 @@ class SessionStore:
             conn.execute(
                 """
                 INSERT INTO tool_calls (
-                    tool_call_id, run_id, session_id, step_id, agent,
-                    tool_name, server_name, action_surface, status,
-                    args_json, result_summary, signed_message, error,
-                    started_at, completed_at, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    tool_call_id, run_id, session_id, step_id,
+                    step_call_index, agent, tool_name, server_name,
+                    action_surface, status, args_json, result_summary,
+                    signed_message, error, started_at, completed_at,
+                    metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     tool_call_id,
                     run_id,
                     session_id,
                     int(step_id) if step_id is not None else None,
+                    int(step_call_index),
                     agent,
                     tool_name,
                     server_name,
@@ -1001,6 +1015,29 @@ class SessionStore:
                 (run_id,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def load_tool_call_for_step(
+        self,
+        run_id: str,
+        step_id: int,
+        step_call_index: int,
+    ) -> dict[str, Any] | None:
+        """Return the persisted ``tool_calls`` row that matches the
+        ``(run_id, step_id, step_call_index)`` idempotency key, or ``None``.
+
+        Used by ``resume_supervisor()`` to skip re-execution of tool calls
+        that have already produced a persisted result. The
+        ``idx_tool_calls_resume_key`` index covers this lookup. Atlas
+        addendum 1215461539268696 finding 4.
+        """
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM tool_calls "
+                "WHERE run_id = ? AND step_id = ? AND step_call_index = ? "
+                "ORDER BY started_at ASC, tool_call_id ASC LIMIT 1",
+                (run_id, int(step_id), int(step_call_index)),
+            ).fetchone()
+        return dict(row) if row else None
 
     # --- rehydration -------------------------------------------------------
 

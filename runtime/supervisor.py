@@ -1158,7 +1158,7 @@ def run_supervisor(
         # (secrets → approval → execute → sign → persist).
         tool_summaries: list[str] = []
         tool_halt = False
-        for tc in step_spec.get("tool_calls", []):
+        for tc_index, tc in enumerate(step_spec.get("tool_calls", [])):
             tool_result = execute_tool(
                 step_spec["target"],
                 tc["tool_name"],
@@ -1166,6 +1166,7 @@ def run_supervisor(
                 run_id=run_id,
                 session_id=session_id,
                 step_id=int(step_spec["id"]),
+                step_call_index=tc_index,
                 store=store,
                 dry_run=dry_run,
             )
@@ -1231,6 +1232,22 @@ def run_supervisor(
 
         if tool_halt:
             return finalize(final_status)
+
+        # 4.7 addendum (Asana 1215461539268696) finding 4 — resume idempotency
+        # test hook. Stops the supervisor AFTER the step's tool calls have
+        # persisted but BEFORE the subagent message is dispatched. Used by
+        # the resume-idempotency dry-run scenario to simulate a crash in
+        # exactly the window where the addendum's blocker lived. Dry-run
+        # only; the same _force-hook guard at the top of run_supervisor()
+        # rejects any live attempt to set this flag.
+        if _stop_after == f"after_tool_calls:{step_spec['id']}":
+            if store is not None:
+                store.update_session(
+                    run_id,
+                    planner_envelope_id=planner_envelope.id,
+                    plan=plan,
+                )
+            return finalize(SUPERVISOR_STATUS_EXECUTING)
 
         # If any tool calls succeeded, fold a redacted signed-summary block
         # into the subagent's message so the LLM sees the tool outputs in
@@ -1747,9 +1764,86 @@ def resume_supervisor(
                         {"tool_name": tc["tool_name"], "args": tc.get("args", {})}
                     )
         # 4.7 main scope: replay tool calls on resume too. Same hook chain.
+        #
+        # Idempotency (Atlas addendum 1215461539268696 finding 4):
+        # before calling ``execute_tool``, look up any persisted row for
+        # this (run_id, step_id, step_call_index). If a row with
+        # status='ok' already exists, skip re-execution and reuse the
+        # persisted signed summary — the original tool already ran during
+        # the prior crash window. If a non-ok row exists, halt
+        # consistently with that row's signed message rather than replay
+        # a guarded/destructive action against an upstream service.
         tool_summaries: list[str] = []
         tool_halt = False
-        for tc in rehydrated_tool_calls:
+        for tc_index, tc in enumerate(rehydrated_tool_calls):
+            persisted_tc = store.load_tool_call_for_step(
+                run_id, int(spec["id"]), tc_index
+            )
+            if persisted_tc is not None:
+                prior_status = persisted_tc["status"]
+                prior_signed = persisted_tc["signed_message"]
+                prior_summary = persisted_tc["result_summary"] or ""
+                tool_summaries.append(
+                    f"  - {persisted_tc['tool_name']} "
+                    f"({persisted_tc['action_surface']}) → "
+                    f"{prior_status} [resume:reused]: {prior_summary[:200]}"
+                )
+                if prior_status == "ok":
+                    continue
+                # Non-ok prior row: halt consistently using the persisted
+                # signed line. No re-execution, no re-redaction.
+                if prior_status == "pending-human-approval":
+                    record = _blocker_record(
+                        phase=f"step_{spec['id']}_tool_pending_human_approval",
+                        reason=prior_summary or "tool gated for human approval",
+                        step_id=int(spec["id"]),
+                        target=spec["target"],
+                        tool_name=persisted_tc["tool_name"],
+                        tool_call_id=persisted_tc["tool_call_id"],
+                        decision="pending-human-approval",
+                        signed_message=prior_signed,
+                    )
+                    blockers.append(record)
+                    _persist_decision(record, kind=DECISION_KIND_BLOCKER)
+                    _persist_gate_if_pending(record)
+                    tool_halt = True
+                    resume_tool_halt_status = (
+                        SUPERVISOR_STATUS_PENDING_HUMAN_APPROVAL
+                    )
+                    break
+                if prior_status == "blocked":
+                    record = _blocker_record(
+                        phase=f"step_{spec['id']}_tool_blocked",
+                        reason=prior_summary or "tool blocked by hook chain",
+                        step_id=int(spec["id"]),
+                        target=spec["target"],
+                        tool_name=persisted_tc["tool_name"],
+                        tool_call_id=persisted_tc["tool_call_id"],
+                        signed_message=prior_signed,
+                    )
+                    blockers.append(record)
+                    _persist_decision(record, kind=DECISION_KIND_BLOCKER)
+                    tool_halt = True
+                    resume_tool_halt_status = SUPERVISOR_STATUS_BLOCKED
+                    break
+                # prior status == errored
+                record = _error_record(
+                    phase=f"step_{spec['id']}_tool_errored",
+                    error=persisted_tc["error"]
+                    or prior_summary
+                    or "tool executor errored",
+                    step_id=int(spec["id"]),
+                    target=spec["target"],
+                    tool_name=persisted_tc["tool_name"],
+                    tool_call_id=persisted_tc["tool_call_id"],
+                    signed_message=prior_signed,
+                )
+                errors.append(record)
+                _persist_decision(record, kind=DECISION_KIND_ERROR)
+                tool_halt = True
+                resume_tool_halt_status = SUPERVISOR_STATUS_ERRORED
+                break
+
             tool_result = execute_tool(
                 spec["target"],
                 tc["tool_name"],
@@ -1757,6 +1851,7 @@ def resume_supervisor(
                 run_id=run_id,
                 session_id=session_id,
                 step_id=int(spec["id"]),
+                step_call_index=tc_index,
                 store=store,
                 dry_run=dry_run,
             )
@@ -3278,7 +3373,7 @@ def _supervisor_dry_run() -> int:
                     run_t.status == SUPERVISOR_STATUS_BLOCKED
                     and len(tool_calls) == 1
                     and tool_calls[0]["status"] == "blocked"
-                    and "deny pattern" in (tool_calls[0]["result_summary"] or "")
+                    and "deny path" in (tool_calls[0]["result_summary"] or "")
                 )
                 record(
                     "supervisor-tool-call-fs-deny-blocked",
@@ -3291,6 +3386,78 @@ def _supervisor_dry_run() -> int:
     except Exception as exc:  # noqa: BLE001
         record(
             "supervisor-tool-call-fs-deny-blocked",
+            False,
+            f"raised {type(exc).__name__}: {exc}",
+        )
+
+    # 37. resume-tool-call-idempotent — 4.7 addendum (Asana 1215461539268696)
+    # finding 4: prove that a tool call which already produced a persisted
+    # ok row is NOT re-executed on resume. Plan: 1 step with 1
+    # filesystem.read_file tool_call against a file inside ORCHESTRA_ROOT.
+    # Crash AFTER the tool call persists ok but BEFORE the subagent
+    # message dispatches (via _stop_after="after_tool_calls:1"). Resume
+    # the same run. Assert: exactly one tool_calls row total (no replay),
+    # run status=complete.
+    try:
+        with tempfile.TemporaryDirectory(prefix="sv-tool-idem-") as t:
+            os.environ["ORCHESTRA_ROOT"] = t
+            try:
+                target_file = Path(t) / "scratch.txt"
+                target_file.write_text("hello", encoding="utf-8")
+                idem_plan = _plan_with_tool_calls(
+                    "Cody",
+                    [
+                        {
+                            "tool_name": "filesystem.read_file",
+                            "args": {"path": str(target_file)},
+                        }
+                    ],
+                )
+                payload = f"<orchestra_plan>{json.dumps(idem_plan)}</orchestra_plan>"
+                store_i = SessionStore(Path(t) / "sessions.db")
+                crashed = run_supervisor(
+                    "tool calls idempotency scenario",
+                    dry_run=True,
+                    store=store_i,
+                    _dry_run_planner_content=payload,
+                    _stop_after="after_tool_calls:1",
+                )
+                rows_after_crash = store_i.load_tool_calls(crashed.run_id)
+                crash_ok = (
+                    crashed.status == SUPERVISOR_STATUS_EXECUTING
+                    and len(rows_after_crash) == 1
+                    and rows_after_crash[0]["status"] == "ok"
+                    and rows_after_crash[0]["step_call_index"] == 0
+                )
+                resumed = resume_supervisor(
+                    crashed.run_id,
+                    store=store_i,
+                    directive="tool calls idempotency scenario",
+                    dry_run=True,
+                )
+                rows_after_resume = store_i.load_tool_calls(resumed.run_id)
+                resume_ok = (
+                    resumed.run_id == crashed.run_id
+                    and resumed.status == SUPERVISOR_STATUS_COMPLETE
+                    and len(rows_after_resume) == 1
+                    and rows_after_resume[0]["tool_call_id"]
+                    == rows_after_crash[0]["tool_call_id"]
+                )
+                record(
+                    "resume-tool-call-idempotent",
+                    crash_ok and resume_ok,
+                    f"crash_status={crashed.status}, "
+                    f"rows_after_crash={len(rows_after_crash)}, "
+                    f"resume_status={resumed.status}, "
+                    f"rows_after_resume={len(rows_after_resume)}, "
+                    f"same_tool_call_id="
+                    f"{rows_after_crash and rows_after_resume and rows_after_crash[0]['tool_call_id'] == rows_after_resume[0]['tool_call_id']}",
+                )
+            finally:
+                os.environ.pop("ORCHESTRA_ROOT", None)
+    except Exception as exc:  # noqa: BLE001
+        record(
+            "resume-tool-call-idempotent",
             False,
             f"raised {type(exc).__name__}: {exc}",
         )
@@ -3373,7 +3540,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run the 36 supervisor scenarios (11 unit + 7 signed-halt + 10 persisted including resume + 2 force-hook guards + 6 tool-registry integration) without any provider API call.",
+        help="Run the 37 supervisor scenarios (11 unit + 7 signed-halt + 10 persisted including resume + 2 force-hook guards + 6 tool-registry integration + 1 resume-idempotency) without any provider API call.",
     )
     parser.add_argument(
         "--directive",

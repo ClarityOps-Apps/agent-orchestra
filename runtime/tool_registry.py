@@ -36,6 +36,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -133,6 +134,14 @@ class ToolCallRequest:
 
     Held as a dataclass so the supervisor's `tool_calls` plan rows can be
     deserialized directly into a request without ad-hoc dict shuffling.
+
+    ``step_call_index`` is the planner-assigned index of this tool call
+    inside a step's ``tool_calls`` list (0-based). It exists so that the
+    resume path can locate a previously-executed call deterministically
+    by (run_id, step_id, step_call_index) — without that handle, a crash
+    after a successful live tool but before the action row updates could
+    cause resume to re-execute the same tool. Addendum at Asana
+    1215461539268696 finding 4.
     """
 
     agent: str
@@ -141,6 +150,7 @@ class ToolCallRequest:
     run_id: str | None = None
     session_id: str | None = None
     step_id: int | None = None
+    step_call_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -243,20 +253,60 @@ BASH_DESTRUCTIVE_PATTERNS: tuple[str, ...] = (
     "reboot",
 )
 
+#: Shell metacharacters and control operators that, if present in a bash
+#: command, indicate an attempt to chain or expand beyond the allowlisted
+#: form. Atlas's probe (addendum 1215461539268696, finding 2) showed that
+#: ``startswith`` allowlisting combined with ``shell=True`` let commands
+#: like ``python -m supervisor --dry-run; echo extra`` slip through. The
+#: registry now rejects every command containing any of these characters
+#: before any tokenization or execution attempt. Even ``$`` is rejected so
+#: command substitution and parameter expansion are uniformly refused.
+BASH_SHELL_METACHARS: tuple[str, ...] = (
+    ";",
+    "&",
+    "|",
+    "$",
+    "`",
+    "(",
+    ")",
+    "<",
+    ">",
+    "\n",
+    "\r",
+    "*",
+    "?",
+    "[",
+    "]",
+    "{",
+    "}",
+    "~",
+    "!",
+    "\\",
+    "#",
+    '"',
+    "'",
+)
+
 #: Per-call bash timeout (seconds). Short enough that a wedged smoke does
 #: not hang the supervisor; long enough that the standard regression block
 #: runs comfortably.
 BASH_TIMEOUT_SECONDS = 120
 
-#: Filesystem deny patterns — anchored to the ORCHESTRA_ROOT-resolved path.
-FILESYSTEM_DENY_SUBSTRINGS: tuple[str, ...] = (
-    "/.env",
-    "/.venv/",
-    "/memory/sessions.db",
-    "/memory/audit/",
+#: Filesystem deny paths relative to ORCHESTRA_ROOT. Each entry is matched
+#: as an EXACT path or as an ancestor of the candidate path — substring
+#: matching is intentionally not used. Atlas's probe (addendum
+#: 1215461539268696, finding 3) showed substring matching missed exact
+#: directory forms (``.venv``, ``memory/audit`` without trailing slash);
+#: path-aware matching catches every shape uniformly.
+FILESYSTEM_DENY_RELATIVE_PATHS: tuple[str, ...] = (
+    ".env",
+    ".venv",
+    "memory/audit",
+    "memory/sessions.db",
 )
 
 #: Filesystem deny extensions — DB / WAL / SHM siblings of sessions.db.
+#: Match against the final path component only, not anywhere in the path.
 FILESYSTEM_DENY_EXTENSIONS: tuple[str, ...] = (
     ".db",
     ".db-wal",
@@ -712,15 +762,43 @@ def orchestra_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+def _is_within(child: Path, ancestor: Path) -> bool:
+    """Return True iff ``child`` equals ``ancestor`` or lives beneath it.
+
+    Implemented via ``relative_to`` to avoid string/substring traps. Both
+    arguments must already be resolved absolute paths; the caller owns
+    resolution so symlink behavior is uniform across the registry.
+    """
+    try:
+        child.relative_to(ancestor)
+        return True
+    except ValueError:
+        return False
+
+
 def _filesystem_path_allowed(raw_path: str) -> tuple[bool, str, Path | None]:
-    """Decide whether a filesystem tool can touch `raw_path`.
+    """Decide whether a filesystem tool can touch ``raw_path``.
 
-    Returns `(allowed, reason, resolved_or_none)`:
-      * `allowed=True, reason="ok"` — path resolves inside ORCHESTRA_ROOT and
-        is not deny-listed.
-      * `allowed=False` — path traversal, deny pattern, or denied extension.
+    Returns ``(allowed, reason, resolved_or_none)``:
+      * ``allowed=True, reason="ok"`` — path resolves inside ORCHESTRA_ROOT
+        and is not deny-listed.
+      * ``allowed=False`` — path traversal, exact-or-descendant deny match,
+        or denied extension on the final component.
 
-    The resolved path is returned on success so callers don't re-resolve it.
+    The matcher is path-aware: each deny entry in
+    ``FILESYSTEM_DENY_RELATIVE_PATHS`` is treated as a directory or file
+    rooted at ORCHESTRA_ROOT, and the candidate is blocked iff it equals
+    that path or is a descendant of it. Substring matches that previously
+    let exact-directory forms like ``.venv`` (no trailing slash) and
+    ``memory/audit`` slip through are gone. Defensively, the result never
+    echoes the user-controlled input — the reason names the matched deny
+    entry by its relative form, never the raw path.
+
+    Reason strings are sanitized through ``redact()`` (Atlas addendum
+    1215461539268696, finding 1) so a secret-shaped substring in the
+    user's path cannot survive in any signed blocker or persisted row,
+    even if the caller chooses to forward this reason verbatim into a
+    halt path.
     """
     if not isinstance(raw_path, str) or not raw_path:
         return False, "path must be a non-empty string", None
@@ -729,30 +807,32 @@ def _filesystem_path_allowed(raw_path: str) -> tuple[bool, str, Path | None]:
     if not candidate.is_absolute():
         candidate = root / candidate
     try:
-        # `resolve(strict=False)` lets us check would-be paths for write_file
-        # too — the parent directory must exist within root, but the file
-        # itself need not pre-exist.
+        # ``resolve(strict=False)`` lets us check would-be paths for
+        # write_file too — the parent directory must exist within root,
+        # but the file itself need not pre-exist.
         resolved = candidate.resolve()
     except (OSError, RuntimeError) as exc:
-        return False, f"could not resolve path: {exc}", None
-    try:
-        resolved.relative_to(root)
-    except ValueError:
+        return False, redact(f"could not resolve path: {exc}"), None
+    if not _is_within(resolved, root):
         return (
             False,
-            f"path traversal outside ORCHESTRA_ROOT ({root}); refused: {raw_path}",
+            redact(
+                f"path traversal outside ORCHESTRA_ROOT ({root}); refused."
+            ),
             None,
         )
-    posix = str(resolved).replace("\\", "/")
-    for substring in FILESYSTEM_DENY_SUBSTRINGS:
-        if substring in posix:
+    for deny_rel in FILESYSTEM_DENY_RELATIVE_PATHS:
+        deny_abs = (root / deny_rel).resolve()
+        if _is_within(resolved, deny_abs):
             return (
                 False,
-                f"path matches filesystem deny pattern {substring!r}",
+                f"path matches filesystem deny path {deny_rel!r} "
+                "(exact match or descendant)",
                 None,
             )
+    name = resolved.name
     for ext in FILESYSTEM_DENY_EXTENSIONS:
-        if posix.endswith(ext):
+        if name.endswith(ext):
             return False, f"path uses denied extension {ext!r}", None
     return True, "ok", resolved
 
@@ -760,25 +840,62 @@ def _filesystem_path_allowed(raw_path: str) -> tuple[bool, str, Path | None]:
 # --- Bash classification -----------------------------------------------------
 
 
+#: Tokenized form of every BASH_SMOKE_ALLOWLIST entry. Computed at module
+#: import so the bash classifier compares token lists rather than string
+#: prefixes — Atlas's probe (addendum 1215461539268696, finding 2) showed
+#: that ``startswith`` allowed ``python -m supervisor --dry-run; echo extra``
+#: to slip through. With token-list matching plus ``shell=False`` plus the
+#: metachar reject above, every chained or expanded form is refused before
+#: any subprocess spawn.
+_BASH_SMOKE_ALLOWLIST_TOKENS: tuple[tuple[str, ...], ...] = tuple(
+    tuple(shlex.split(entry)) for entry in BASH_SMOKE_ALLOWLIST
+)
+
+
 def _bash_classification(command: str) -> tuple[str, str | None]:
-    """Return `(classification, matched_pattern_or_none)`.
+    """Return ``(classification, matched_pattern_or_none)``.
 
     classification ∈ {
-      "allowlisted_smoke",   # safe-to-run after gate
-      "destructive_blocked", # contains a destructive token
-      "not_allowlisted",     # neither allowlisted nor destructive
+      "allowlisted_smoke",     # safe-to-run after gate
+      "destructive_blocked",   # contains a destructive token
+      "shell_metachars_blocked", # contains shell metachars / control ops
+      "tokenize_error",        # shlex could not tokenize the command
+      "not_allowlisted",       # tokenized form not in the allowlist
     }
+
+    Order of checks matters: destructive tokens are caught first so the
+    signed blocker can name the matched destructive pattern even when the
+    command also contains shell metachars. After that, metachar rejection
+    catches every chaining / expansion attempt. Only then does the
+    classifier shlex-tokenize and compare against the canonical allowlist.
     """
     if not isinstance(command, str) or not command.strip():
         return "not_allowlisted", None
-    lowered = command.strip().lower()
+    stripped = command.strip()
+    lowered = stripped.lower()
     for pattern in BASH_DESTRUCTIVE_PATTERNS:
         if pattern.lower() in lowered:
             return "destructive_blocked", pattern
-    for prefix in BASH_SMOKE_ALLOWLIST:
-        if lowered.startswith(prefix.lower()):
-            return "allowlisted_smoke", prefix
+    for metachar in BASH_SHELL_METACHARS:
+        if metachar in stripped:
+            return "shell_metachars_blocked", metachar
+    try:
+        tokens = tuple(shlex.split(stripped, posix=True))
+    except ValueError as exc:
+        return "tokenize_error", str(exc)
+    for allowed_tokens in _BASH_SMOKE_ALLOWLIST_TOKENS:
+        if tokens == allowed_tokens:
+            # Exact token-list match — represent the matched form by its
+            # canonical string for the signed audit line.
+            return "allowlisted_smoke", " ".join(allowed_tokens)
     return "not_allowlisted", None
+
+
+def _bash_tokenize(command: str) -> tuple[str, ...]:
+    """Return the shlex-tokenized form of ``command``. Used by the executor
+    so the subprocess call passes a token list with ``shell=False`` rather
+    than handing the raw string to ``/bin/sh -c``."""
+    return tuple(shlex.split(command.strip(), posix=True))
 
 
 # --- Executors (live adapters) ----------------------------------------------
@@ -1006,25 +1123,32 @@ def _exec_filesystem_write_file(args: Mapping[str, Any]) -> dict[str, Any]:
 def _exec_bash_run_smoke(args: Mapping[str, Any]) -> dict[str, Any]:
     command = args["command"]
     classification, matched = _bash_classification(command)
-    # Arg validation already rejected destructive and non-allowlisted commands
-    # before we reach here. Re-checking is defense-in-depth: if the registry's
-    # validation logic ever drifted, the executor refuses to spawn the shell.
+    # Arg validation already rejected destructive, metachar-laden, and
+    # non-allowlisted commands before we reach here. Re-checking is
+    # defense-in-depth: if the classifier ever drifted, the executor still
+    # refuses to spawn a subprocess.
     if classification != "allowlisted_smoke":
         raise ToolExecutionError(
             f"bash command not allowlisted (classification={classification}, "
             f"matched={matched})"
         )
+    tokens = _bash_tokenize(command)
+    if not tokens:
+        raise ToolExecutionError("bash command tokenized to an empty list")
     timeout = int(args.get("timeout", BASH_TIMEOUT_SECONDS))
-    completed = subprocess.run(  # noqa: S603 - allowlisted command surface
-        command,
-        shell=True,  # noqa: S602 - allowlisted via _bash_classification
+    # ``shell=False`` so the kernel exec's the resolved token list directly.
+    # No /bin/sh interpretation, no metachar expansion. Token list is the
+    # exact canonical allowlist form (matched in the classifier above).
+    completed = subprocess.run(  # noqa: S603 - tokenized + allowlisted
+        list(tokens),
+        shell=False,
         capture_output=True,
         text=True,
         timeout=timeout,
         check=False,
     )
     return {
-        "command": command,
+        "command": " ".join(tokens),
         "exit_code": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
@@ -1089,10 +1213,22 @@ def _validate_tool_args(spec: ToolSpec, args: Mapping[str, Any]) -> None:
                 f"bash command refused before execution: destructive token "
                 f"{matched!r} matched"
             )
+        if classification == "shell_metachars_blocked":
+            raise ToolArgError(
+                f"bash command refused before execution: shell metacharacter "
+                f"{matched!r} not permitted (chaining/expansion would bypass "
+                "the allowlist)"
+            )
+        if classification == "tokenize_error":
+            raise ToolArgError(
+                f"bash command refused before execution: shlex tokenize "
+                f"error — {matched}"
+            )
         if classification == "not_allowlisted":
             raise ToolArgError(
                 "bash command refused before execution: not on the smoke "
-                "allowlist"
+                "allowlist (tokenized form must exactly match a canonical "
+                "smoke command)"
             )
 
 
@@ -1219,6 +1355,7 @@ def _persist_tool_call(
         run_id=request.run_id,
         session_id=request.session_id,
         step_id=request.step_id,
+        step_call_index=request.step_call_index,
         agent=result.agent,
         tool_name=result.tool_name,
         server_name=result.server_name,
@@ -1242,6 +1379,7 @@ def execute_tool(
     run_id: str | None = None,
     session_id: str | None = None,
     step_id: int | None = None,
+    step_call_index: int = 0,
     store: Any | None = None,
     dry_run: bool = False,
 ) -> ToolCallResult:
@@ -1249,21 +1387,28 @@ def execute_tool(
 
     Hook order — every call goes through every step in sequence:
 
-      1. canonicalize agent via `agent_factory._canonicalize`
+      1. canonicalize agent via ``agent_factory._canonicalize``
       2. look up the tool spec; refuse unknown tools
       3. check the agent/tool permission matrix
-      4. validate args (presence, FS path, bash classification)
-      5. secrets_check on the redacted args payload
+      4. secrets_check on the RAW args payload (must run before any
+         validation message that could echo user input)
+      5. validate args (presence, FS path, bash classification) — every
+         exception string is redacted before it touches a signed line
       6. classify_surface() then check_approval_gate()
       7. execute (live or dry-run synthetic)
       8. sign the result/blocker line with the acting agent
-      9. redact summary, persist to `tool_calls`
+      9. redact summary, persist to ``tool_calls``
 
-    Every halt path returns a `ToolCallResult` with a signed message and a
-    status drawn from `VALID_TOOL_STATUSES`. The function does not raise on
-    domain-level halts; it only raises `ToolRegistryError` / `UnknownAgentError`
-    for *type-level* mistakes (unknown agent, unknown tool) that callers
-    must surface immediately.
+    The secrets-first ordering implements Atlas's addendum 1215461539268696
+    finding 1: a path argument like ``/tmp/sk-proj-DDDD…/.env`` must never
+    reach a validator whose exception string echoes the raw path into a
+    signed_message or persisted summary.
+
+    Every halt path returns a ``ToolCallResult`` with a signed message and a
+    status drawn from ``VALID_TOOL_STATUSES``. The function does not raise on
+    domain-level halts; it only raises ``ToolRegistryError`` /
+    ``UnknownAgentError`` for *type-level* mistakes (unknown agent, unknown
+    tool) that callers must surface immediately.
     """
     args = dict(args or {})
     started_at = _utc_now_iso()
@@ -1289,6 +1434,7 @@ def execute_tool(
             run_id=run_id,
             session_id=session_id,
             step_id=step_id,
+            step_call_index=step_call_index,
         )
         redacted_args = _redact_args(args)
         result = _result(
@@ -1314,39 +1460,16 @@ def execute_tool(
         run_id=run_id,
         session_id=session_id,
         step_id=step_id,
+        step_call_index=step_call_index,
     )
     redacted_args = _redact_args(args)
 
-    # Step 4 — arg validation. Failure produces a signed blocker named after
-    # the violated rule (FS path traversal, deny pattern, bash deny).
-    try:
-        _validate_tool_args(spec, args)
-    except ToolArgError as exc:
-        signed = sign_action(
-            "Atlas",
-            f"Tool blocked: {spec.tool_name} arg validation refused — {exc}",
-        )
-        result = _result(
-            tool_call_id=tool_call_id,
-            status=TOOL_STATUS_BLOCKED,
-            surface=spec.action_surface,
-            signed=signed,
-            summary=str(exc),
-            redacted_args=redacted_args,
-            agent=canonical_agent,
-            tool_name=spec.tool_name,
-            server_name=spec.server_name,
-            started_at=started_at,
-            metadata={"reason": "arg_validation"},
-        )
-        _persist_tool_call(store, result, request=request)
-        return result
-
-    # Step 5 — secrets check on the redacted args payload AND the result
-    # summary placeholder (no result yet, so this is purely an input check).
-    # The redacted form is what gets persisted; the original args are
-    # inspected for secret-shaped tokens that would have leaked into a live
-    # call had we proceeded.
+    # Step 4 — secrets check on the RAW args payload. Runs BEFORE arg
+    # validation so a secret-shaped substring in a user-controlled arg
+    # (e.g. a path that happens to contain ``sk-proj-...``) cannot reach
+    # a validator whose exception string would echo the raw payload into
+    # a signed blocker / persisted row. Atlas addendum 1215461539268696,
+    # finding 1.
     raw_payload = json.dumps(
         args, sort_keys=True, ensure_ascii=False, default=str
     )
@@ -1355,8 +1478,9 @@ def execute_tool(
         secret_result = check_for_secrets(raw_payload, actor="Atlas")
         signed = sign_action(
             "Atlas",
-            f"Tool blocked: {spec.tool_name} args contain {', '.join(secrets_kinds)}. "
-            "Payload not forwarded to executor; not persisted in raw form.",
+            f"Tool blocked: {spec.tool_name} args contain "
+            f"{', '.join(secrets_kinds)}. Payload not forwarded to executor; "
+            "not persisted in raw form.",
         )
         result = _result(
             tool_call_id=tool_call_id,
@@ -1373,6 +1497,34 @@ def execute_tool(
                 "reason": "args_secrets_block",
                 "secret_kinds": list(secret_result.matches),
             },
+        )
+        _persist_tool_call(store, result, request=request)
+        return result
+
+    # Step 5 — arg validation. Every exception string is run through
+    # ``redact()`` before it touches a signed line / persisted row so
+    # belt-and-suspenders covers Atlas finding 1 even if a future
+    # validator forgets to redact its own message.
+    try:
+        _validate_tool_args(spec, args)
+    except ToolArgError as exc:
+        safe_exc = redact(str(exc))
+        signed = sign_action(
+            "Atlas",
+            f"Tool blocked: {spec.tool_name} arg validation refused — {safe_exc}",
+        )
+        result = _result(
+            tool_call_id=tool_call_id,
+            status=TOOL_STATUS_BLOCKED,
+            surface=spec.action_surface,
+            signed=signed,
+            summary=safe_exc,
+            redacted_args=redacted_args,
+            agent=canonical_agent,
+            tool_name=spec.tool_name,
+            server_name=spec.server_name,
+            started_at=started_at,
+            metadata={"reason": "arg_validation"},
         )
         _persist_tool_call(store, result, request=request)
         return result
@@ -1745,7 +1897,7 @@ def _dry_run() -> int:
             record(
                 "cody-fs-deny-env",
                 result.status == TOOL_STATUS_BLOCKED
-                and "deny pattern" in result.result_summary,
+                and "deny path '.env'" in result.result_summary,
                 f"status={result.status}, summary={result.result_summary[:120]}",
             )
             # 10. Filesystem deny: path traversal.
@@ -1771,7 +1923,7 @@ def _dry_run() -> int:
             record(
                 "cody-fs-deny-db",
                 result.status == TOOL_STATUS_BLOCKED
-                and ("deny pattern" in result.result_summary
+                and ("deny path 'memory/sessions.db'" in result.result_summary
                      or "denied extension" in result.result_summary),
                 f"status={result.status}, summary={result.result_summary[:120]}",
             )
@@ -1909,6 +2061,99 @@ def _dry_run() -> int:
         and "missing required args" in result.result_summary,
         f"status={result.status}, summary={result.result_summary[:120]}",
     )
+
+    # --- 4.7 addendum (Asana 1215461539268696) scenarios ---------------------
+
+    # A1. Secret-shaped substring inside a user-controlled FS path must NOT
+    # survive in signed_message, result_summary, redacted_args, or metadata.
+    # Atlas's probe shape: filesystem.read_file with path containing a
+    # synthetic openai_api_key token. Hook chain now runs secrets_check
+    # BEFORE arg validation and redacts every validation message before
+    # signing/persistence.
+    synthetic = "sk-proj-DDDDDDDDDDDDDDDDDDDD"
+    result = execute_tool(
+        "Cody",
+        "filesystem.read_file",
+        {"path": f"/tmp/{synthetic}/.env"},
+        dry_run=True,
+    )
+    leak = any(
+        synthetic in (field or "")
+        for field in (
+            result.signed_message,
+            result.result_summary,
+            result.redacted_args,
+            json.dumps(dict(result.metadata)),
+        )
+    )
+    record(
+        "addendum-secrets-before-validation",
+        result.status == TOOL_STATUS_BLOCKED and not leak,
+        f"status={result.status}, raw_token_survived={leak}, "
+        f"summary={result.result_summary[:120]}",
+    )
+
+    # A2a–d. bash.run_smoke must reject every shell tail attempt.
+    bash_attack_cases = (
+        ("semicolon", "python -m supervisor --dry-run; echo extra"),
+        ("logical-and", "python -m supervisor --dry-run && echo extra"),
+        ("pipe", "python -m supervisor --dry-run | cat"),
+        ("command-substitution", "python -m supervisor --dry-run$(echo hi)"),
+    )
+    for label, attack in bash_attack_cases:
+        result = execute_tool(
+            "Scout",
+            "bash.run_smoke",
+            {"command": attack},
+            dry_run=True,
+        )
+        record(
+            f"addendum-bash-shell-{label}-blocked",
+            result.status == TOOL_STATUS_BLOCKED
+            and "shell metacharacter" in result.result_summary,
+            f"status={result.status}, summary={result.result_summary[:120]}",
+        )
+
+    # A3a–d. Filesystem deny must block exact directory and descendant forms
+    # for ``.venv`` and ``memory/audit`` — both with and without trailing
+    # slash and via descendant paths. Atlas's probe showed substring
+    # matching let these slip through.
+    with tempfile.TemporaryDirectory(prefix="orchestra-fs-deny-") as tmp:
+        os.environ["ORCHESTRA_ROOT"] = tmp
+        try:
+            (Path(tmp) / ".venv").mkdir(parents=True, exist_ok=True)
+            (Path(tmp) / "memory" / "audit").mkdir(parents=True, exist_ok=True)
+            (Path(tmp) / "memory" / "audit" / "2026-06-05.md").write_text(
+                "sample", encoding="utf-8"
+            )
+            (Path(tmp) / ".venv" / "marker.txt").write_text("x", encoding="utf-8")
+            fs_cases = (
+                ("dotvenv-exact", "list_dir", f"{tmp}/.venv"),
+                ("dotvenv-trailing-slash", "list_dir", f"{tmp}/.venv/"),
+                ("dotvenv-descendant", "read_file", f"{tmp}/.venv/marker.txt"),
+                ("memory-audit-exact", "list_dir", f"{tmp}/memory/audit"),
+                ("memory-audit-trailing", "list_dir", f"{tmp}/memory/audit/"),
+                (
+                    "memory-audit-descendant",
+                    "read_file",
+                    f"{tmp}/memory/audit/2026-06-05.md",
+                ),
+            )
+            for label, tool, path in fs_cases:
+                result = execute_tool(
+                    "Cody",
+                    f"filesystem.{tool}",
+                    {"path": path},
+                    dry_run=True,
+                )
+                record(
+                    f"addendum-fs-deny-{label}",
+                    result.status == TOOL_STATUS_BLOCKED
+                    and "deny path" in result.result_summary,
+                    f"status={result.status}, summary={result.result_summary[:120]}",
+                )
+        finally:
+            os.environ.pop("ORCHESTRA_ROOT", None)
 
     # 22. Persisted tool_calls row — full round-trip through SessionStore v2.
     with tempfile.TemporaryDirectory(prefix="orchestra-tools-store-") as tmp:
