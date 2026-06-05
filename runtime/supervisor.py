@@ -124,12 +124,93 @@ class PlanError(ValueError):
     """Raised when the planner output cannot be parsed or validated."""
 
 
+# --- Transient provider-error catch list (M4 task 4.7 narrow step) ----------
+#
+# Provider SDKs raise their own HTTP-tier exceptions (HTTP 429 rate limit,
+# HTTP 529 Anthropic overload, generic API status, connection errors).
+# 4.6's closure flag noted that `anthropic.OverloadedError` surfaced as a
+# raw traceback because `_execute_step` only caught the runtime's own
+# named exceptions. 4.7 step 1 wraps those transient errors at every
+# planner/step/finalizer call site so they become signed Atlas error
+# decisions rather than tracebacks.
+#
+# Imported defensively: missing classes in either SDK simply omit that
+# entry from the catch tuple. The runtime never imports a class it can't
+# find; the dry-run scenarios remain safe even if a future SDK rename
+# removes one of these names.
+def _collect_transient_provider_errors() -> tuple[type[BaseException], ...]:
+    """Return the catch tuple of known provider transient/API errors.
+
+    Always returns at least `()`; never raises on missing SDKs or
+    renamed classes. Callers should add the result to their
+    `except (...)` tuple alongside the runtime's own exception types.
+
+    Probes both the top-level SDK module (where the public/canonical
+    classes typically live) and `<sdk>._exceptions` (where SDK internals
+    keep specialised subclasses). The anthropic SDK exposes
+    `APIStatusError`/`RateLimitError`/etc. at the top level but keeps
+    HTTP-status-specific subclasses like `OverloadedError`,
+    `ServiceUnavailableError`, `InternalServerError`,
+    `DeadlineExceededError`, and `RequestTooLargeError` only under
+    `anthropic._exceptions`. We want the catch tuple to include both
+    layers so the signed error decision can name the specific class.
+    """
+    found: list[type[BaseException]] = []
+    candidates = (
+        # Top-level public classes (canonical for the runtime catch).
+        ("anthropic", "OverloadedError"),
+        ("anthropic", "RateLimitError"),
+        ("anthropic", "APIStatusError"),
+        ("anthropic", "APIConnectionError"),
+        ("anthropic", "APITimeoutError"),
+        ("openai", "RateLimitError"),
+        ("openai", "APIStatusError"),
+        ("openai", "APIConnectionError"),
+        ("openai", "APITimeoutError"),
+        # Internal _exceptions: HTTP-status-specific subclasses some SDKs
+        # raise rather than the parent APIStatusError. Probed defensively
+        # so an SDK that doesn't expose these still works fine.
+        ("anthropic._exceptions", "OverloadedError"),
+        ("anthropic._exceptions", "ServiceUnavailableError"),
+        ("anthropic._exceptions", "InternalServerError"),
+        ("anthropic._exceptions", "DeadlineExceededError"),
+        ("anthropic._exceptions", "RequestTooLargeError"),
+        ("openai._exceptions", "InternalServerError"),
+    )
+    for module_name, class_name in candidates:
+        try:
+            module = __import__(module_name, fromlist=[class_name])
+        except ImportError:
+            continue
+        cls = getattr(module, class_name, None)
+        if (
+            cls is not None
+            and isinstance(cls, type)
+            and issubclass(cls, BaseException)
+            and cls not in found
+        ):
+            found.append(cls)
+    return tuple(found)
+
+
+TRANSIENT_PROVIDER_ERRORS: tuple[type[BaseException], ...] = (
+    _collect_transient_provider_errors()
+)
+
+
 # --- Dataclasses -------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class SupervisorStep:
-    """In-memory record of one subagent turn."""
+    """In-memory record of one subagent turn.
+
+    `error_info` is populated when `status == STEP_STATUS_ERRORED`. It
+    carries a small dict with the exception class name, message, and a
+    `kind` tag (`transient_provider` vs `runtime`) so the run-level
+    error-decision record can surface a useful signed message rather
+    than the generic "send_message raised" line.
+    """
 
     id: int
     target: str
@@ -140,6 +221,7 @@ class SupervisorStep:
     response_envelope: MessageEnvelope | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    error_info: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -512,10 +594,28 @@ def _execute_step(
     session_id: str,
     parent_id: str,
     dry_run: bool,
+    *,
+    _force_exception: BaseException | None = None,
 ) -> SupervisorStep:
-    """Run one subagent step and return its SupervisorStep record."""
+    """Run one subagent step and return its SupervisorStep record.
+
+    Provider-transient errors from `send_message` (e.g. Anthropic 529
+    overload, OpenAI rate-limit) are caught alongside the runtime's own
+    named errors and surfaced as `status=STEP_STATUS_ERRORED` with a
+    populated `error_info` dict. The run-level error decision then
+    carries a signed Atlas message that names the exception class
+    instead of leaking a raw traceback. Task 4.7 step 1; resolves the
+    4.6 closure flag where a 529 surfaced raw.
+
+    `_force_exception` is a dry-run-only test hook. When provided, the
+    given exception is raised in place of the real `send_message` call
+    so the supervisor's transient-error wrapping is regression-covered
+    without forcing a real upstream failure.
+    """
     started_at = _utc_now()
     try:
+        if _force_exception is not None:
+            raise _force_exception
         response = send_message(
             "Atlas",
             step_spec["target"],
@@ -542,6 +642,28 @@ def _execute_step(
             response_envelope=None,
             started_at=started_at,
             completed_at=_utc_now(),
+            error_info={
+                "kind": "runtime",
+                "exception_class": type(exc).__name__,
+                "message": str(exc),
+            },
+        )
+    except TRANSIENT_PROVIDER_ERRORS as exc:
+        return SupervisorStep(
+            id=step_spec["id"],
+            target=step_spec["target"],
+            message=step_spec["message"],
+            action_surface=step_spec["action_surface"],
+            reason=step_spec["reason"],
+            status=STEP_STATUS_ERRORED,
+            response_envelope=None,
+            started_at=started_at,
+            completed_at=_utc_now(),
+            error_info={
+                "kind": "transient_provider",
+                "exception_class": type(exc).__name__,
+                "message": str(exc),
+            },
         )
     if response.message_type == MESSAGE_TYPE_BLOCKER:
         return SupervisorStep(
@@ -651,6 +773,8 @@ def run_supervisor(
     store: SessionStore | None = None,
     _dry_run_planner_content: str | None = None,
     _stop_after: str | None = None,
+    _force_step_exception: BaseException | None = None,
+    _force_step_target_id: int | None = None,
 ) -> SupervisorRun:
     """Run one supervisor invocation and return a `SupervisorRun` record.
 
@@ -899,6 +1023,18 @@ def run_supervisor(
         errors.append(record)
         _persist_decision(record, kind=DECISION_KIND_ERROR)
         return finalize(SUPERVISOR_STATUS_ERRORED)
+    except TRANSIENT_PROVIDER_ERRORS as exc:
+        # 4.7 step 1: wrap provider transient errors so a 529 or 429 never
+        # surfaces as a raw traceback.
+        record = _error_record(
+            phase="planner_provider_transient",
+            error=f"{type(exc).__name__}: {exc}",
+            exception_class=type(exc).__name__,
+            kind="transient_provider",
+        )
+        errors.append(record)
+        _persist_decision(record, kind=DECISION_KIND_ERROR)
+        return finalize(SUPERVISOR_STATUS_ERRORED)
     except Exception as exc:  # noqa: BLE001 - last-resort: don't surface raw traceback
         record = _error_record(
             phase="planner_call", error=f"{type(exc).__name__}: {exc}"
@@ -954,6 +1090,15 @@ def run_supervisor(
             session_id=session_id,
             parent_id=planner_envelope.id,
             dry_run=dry_run,
+            _force_exception=(
+                _force_step_exception
+                if _force_step_exception is not None
+                and (
+                    _force_step_target_id is None
+                    or _force_step_target_id == step_spec["id"]
+                )
+                else None
+            ),
         )
         steps.append(step)
         _persist_step_result(step)
@@ -993,11 +1138,34 @@ def run_supervisor(
                 return finalize(SUPERVISOR_STATUS_PENDING_HUMAN_APPROVAL)
             return finalize(SUPERVISOR_STATUS_BLOCKED)
         if step.status == STEP_STATUS_ERRORED:
+            # Use the step's error_info when populated (4.7 step 1) to
+            # name the actual exception class. Falls back to the legacy
+            # generic message when error_info is absent (older code
+            # paths or rehydrated steps).
+            info = step.error_info or {}
+            kind = str(info.get("kind", "runtime"))
+            exc_class = info.get("exception_class")
+            exc_message = info.get("message")
+            if exc_class:
+                error_text = (
+                    f"step {step.id} {kind} error from {step.target} "
+                    f"({exc_class}): {exc_message}"
+                )
+                phase = (
+                    f"step_{step.id}_provider_transient"
+                    if kind == "transient_provider"
+                    else f"step_{step.id}_error"
+                )
+            else:
+                error_text = "send_message raised during step execution"
+                phase = f"step_{step.id}_error"
             record = _error_record(
-                phase=f"step_{step.id}_error",
-                error="send_message raised during step execution",
+                phase=phase,
+                error=error_text,
                 step_id=step.id,
                 target=step.target,
+                exception_class=exc_class,
+                error_kind=kind,
             )
             errors.append(record)
             _persist_decision(record, kind=DECISION_KIND_ERROR)
@@ -1026,6 +1194,17 @@ def run_supervisor(
         return finalize(SUPERVISOR_STATUS_ERRORED)
     except ImportError as exc:
         record = _error_record(phase="finalizer_sdk", error=str(exc))
+        errors.append(record)
+        _persist_decision(record, kind=DECISION_KIND_ERROR)
+        return finalize(SUPERVISOR_STATUS_ERRORED)
+    except TRANSIENT_PROVIDER_ERRORS as exc:
+        # 4.7 step 1: wrap provider transient errors for the finalizer too.
+        record = _error_record(
+            phase="finalizer_provider_transient",
+            error=f"{type(exc).__name__}: {exc}",
+            exception_class=type(exc).__name__,
+            kind="transient_provider",
+        )
         errors.append(record)
         _persist_decision(record, kind=DECISION_KIND_ERROR)
         return finalize(SUPERVISOR_STATUS_ERRORED)
@@ -1292,6 +1471,16 @@ def resume_supervisor(
             errors.append(record)
             _persist_decision(record, kind=DECISION_KIND_ERROR)
             return _finalize_in_place(SUPERVISOR_STATUS_ERRORED)
+        except TRANSIENT_PROVIDER_ERRORS as exc:
+            record = _error_record(
+                phase="planner_provider_transient",
+                error=f"{type(exc).__name__}: {exc}",
+                exception_class=type(exc).__name__,
+                kind="transient_provider",
+            )
+            errors.append(record)
+            _persist_decision(record, kind=DECISION_KIND_ERROR)
+            return _finalize_in_place(SUPERVISOR_STATUS_ERRORED)
         except Exception as exc:  # noqa: BLE001
             record = _error_record(
                 phase="planner_call", error=f"{type(exc).__name__}: {exc}"
@@ -1441,6 +1630,16 @@ def resume_supervisor(
             return _finalize_in_place(SUPERVISOR_STATUS_ERRORED)
         except ImportError as exc:
             record = _error_record(phase="finalizer_sdk", error=str(exc))
+            errors.append(record)
+            _persist_decision(record, kind=DECISION_KIND_ERROR)
+            return _finalize_in_place(SUPERVISOR_STATUS_ERRORED)
+        except TRANSIENT_PROVIDER_ERRORS as exc:
+            record = _error_record(
+                phase="finalizer_provider_transient",
+                error=f"{type(exc).__name__}: {exc}",
+                exception_class=type(exc).__name__,
+                kind="transient_provider",
+            )
             errors.append(record)
             _persist_decision(record, kind=DECISION_KIND_ERROR)
             return _finalize_in_place(SUPERVISOR_STATUS_ERRORED)
@@ -2240,6 +2439,85 @@ def _supervisor_dry_run() -> int:
         except Exception as exc:  # noqa: BLE001
             record("persisted-redaction", False, f"raised {type(exc).__name__}: {exc}")
 
+    # 27. persisted-provider-transient-step — 4.7 step 1: prove a synthetic
+    # provider transient error during a subagent step becomes a signed
+    # Atlas error decision (phase=step_N_provider_transient) instead of
+    # surfacing as a raw traceback. This regression-covers the 4.6
+    # closure flag without forcing a real upstream failure.
+    try:
+        import anthropic  # noqa: PLC0415
+
+        overload_cls = getattr(anthropic, "OverloadedError", None)
+        if overload_cls is None:
+            # SDK 0.x exposes OverloadedError only under _exceptions.
+            try:
+                from anthropic import _exceptions as _anth_exc  # noqa: PLC0415
+            except ImportError:
+                _anth_exc = None  # type: ignore[assignment]
+            if _anth_exc is not None:
+                overload_cls = getattr(_anth_exc, "OverloadedError", None)
+        if overload_cls is None:
+            record(
+                "persisted-provider-transient-step",
+                False,
+                "anthropic.OverloadedError not importable from top-level or _exceptions; skipping",
+            )
+        else:
+            # Construct without calling __init__ to avoid SDK constructor
+            # signature drift breaking the test.
+            synthetic = overload_cls.__new__(overload_cls)
+            synthetic.args = ("simulated 529 overload",)
+            store_t = SessionStore(tmp_path / "transient.db")
+            run_t = run_supervisor(
+                "Provider-transient smoke.",
+                dry_run=True,
+                store=store_t,
+                _force_step_exception=synthetic,
+                _force_step_target_id=1,
+            )
+            decisions = store_t.load_decisions(run_t.run_id)
+            transient_decisions = [
+                d
+                for d in decisions
+                if d["phase"] == "step_1_provider_transient"
+            ]
+            try:
+                meta = (
+                    json.loads(transient_decisions[0]["metadata_json"])
+                    if transient_decisions
+                    else {}
+                )
+            except (json.JSONDecodeError, KeyError):
+                meta = {}
+            ok = (
+                run_t.status == SUPERVISOR_STATUS_ERRORED
+                and len(transient_decisions) == 1
+                and transient_decisions[0]["signed_message"].startswith("[Atlas · ")
+                and meta.get("exception_class") == "OverloadedError"
+                and meta.get("error_kind") == "transient_provider"
+            )
+            record(
+                "persisted-provider-transient-step",
+                ok,
+                "signed step_1_provider_transient decision persisted with "
+                "exception_class=OverloadedError, kind=transient_provider"
+                if ok
+                else f"unexpected: status={run_t.status}, "
+                f"transient_decisions={transient_decisions}, meta={meta}",
+            )
+    except ImportError:
+        record(
+            "persisted-provider-transient-step",
+            False,
+            "anthropic SDK not installed; skipping",
+        )
+    except Exception as exc:  # noqa: BLE001
+        record(
+            "persisted-provider-transient-step",
+            False,
+            f"raised {type(exc).__name__}: {exc}",
+        )
+
     for case in passes:
         print(sign_action("Cody", f"supervisor dry-run pass — {case}"))
     for case in failures:
@@ -2318,7 +2596,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run the 26 supervisor scenarios (11 unit + 7 signed-halt + 8 persisted, including 3 in-place resume scenarios) without any provider API call.",
+        help="Run the 27 supervisor scenarios (11 unit + 7 signed-halt + 9 persisted, including 3 in-place resume and 1 provider-transient) without any provider API call.",
     )
     parser.add_argument(
         "--directive",
