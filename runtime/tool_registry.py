@@ -805,19 +805,24 @@ def _filesystem_path_allowed(raw_path: str) -> tuple[bool, str, Path | None]:
     root = orchestra_root()
     candidate = Path(raw_path)
     if not candidate.is_absolute():
-        # Atlas adjudication 1215508295203221 finding 2: planners and
-        # operators naturally write repo-style paths ("runtime/status.py")
-        # even when the cwd is already runtime/, so the relative resolve
-        # used to double the segment
-        # (runtime → runtime/runtime/status.py). Strip a single redundant
-        # leading root-name component before the join so the path lands
-        # at the right place. Deny checks run AFTER normalization so
+        # Atlas adjudication 1215508295203221 finding 2 + micro-addendum
+        # 1215511846444634: planners and operators naturally write
+        # repo-style paths ("runtime/status.py", or just "runtime" for a
+        # list of the runtime root) even when the cwd is already
+        # runtime/. Without normalization the relative resolve doubles
+        # the segment (runtime → runtime/runtime/status.py;
+        # runtime → runtime/runtime). Strip the redundant leading
+        # root-name component before the join, INCLUDING the case where
+        # it is the entire relative path. After stripping, an empty
+        # parts tuple normalizes to ``Path('.')`` so the join lands at
+        # the root itself. Deny checks run AFTER normalization so
         # ``runtime/.env``, ``runtime/memory/sessions.db``,
         # ``runtime/memory/audit/...``, traversal, and denied extensions
         # are still refused.
         parts = candidate.parts
-        if len(parts) > 1 and parts[0] == root.name:
-            candidate = Path(*parts[1:])
+        if parts and parts[0] == root.name:
+            remaining = parts[1:]
+            candidate = Path(*remaining) if remaining else Path(".")
         candidate = root / candidate
     try:
         # ``resolve(strict=False)`` lets us check would-be paths for
@@ -2422,11 +2427,34 @@ def _dry_run() -> int:
             nested_expected = (root_dir / "llm" / "agent_factory.py").resolve()
             nested_ok = allowed_nested and resolved_nested == nested_expected
 
+            # Atlas micro-addendum 1215511846444634: bare ``runtime`` and
+            # ``runtime/`` (no subpath) must resolve to <ORCHESTRA_ROOT>,
+            # not <ORCHESTRA_ROOT>/runtime. Also covers the sibling
+            # idiomatic forms ``./runtime`` and ``runtime/.`` so agents
+            # cannot trip the same doubling class on any equivalent way
+            # of expressing "the runtime root".
+            root_resolved = root_dir.resolve()
+            bare_runtime_cases = (
+                "runtime",
+                "runtime/",
+                "./runtime",
+                "runtime/.",
+            )
+            bare_runtime_failures: list[str] = []
+            for raw in bare_runtime_cases:
+                allowed_br, reason_br, resolved_br = _filesystem_path_allowed(raw)
+                if not allowed_br or resolved_br != root_resolved:
+                    bare_runtime_failures.append(
+                        f"{raw!r}: allowed={allowed_br} resolved={resolved_br}"
+                    )
+            bare_runtime_ok = not bare_runtime_failures
+
             record(
                 "addendum-fs-runtime-prefix-normalization",
-                normalized_ok and bare_ok and nested_ok,
+                normalized_ok and bare_ok and nested_ok and bare_runtime_ok,
                 f"normalized_ok={normalized_ok}, bare_ok={bare_ok}, "
-                f"nested_ok={nested_ok}",
+                f"nested_ok={nested_ok}, bare_runtime_ok={bare_runtime_ok}, "
+                f"bare_runtime_failures={bare_runtime_failures}",
             )
 
             # B4. Deny-list stays strict AFTER normalization — `runtime/.env`,
