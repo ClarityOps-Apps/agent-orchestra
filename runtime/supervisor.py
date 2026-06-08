@@ -297,6 +297,38 @@ def _redact_and_cap(line: str) -> str:
     return redacted[:EVENT_LINE_MAX_CHARS] + "…[truncated]"
 
 
+def _format_tool_summary_line(
+    tool_name: str,
+    action_surface: str,
+    status: str,
+    result_summary: str,
+    *,
+    resume_reused: bool = False,
+) -> str:
+    """Format one tool-call result line for the subagent's
+    ``<orchestra_tool_results>`` context block.
+
+    Atlas adjudication 1215508295203221 finding 1: the supervisor's prior
+    three ``result_summary[:200]`` ad-hoc slices re-truncated the
+    already-redacted-and-capped registry summary back down to 200 chars,
+    erasing the per-tool budget that ``tool_registry`` applies. Routing
+    every site through this helper preserves the full result_summary
+    (already redact-before-cap safe from the registry boundary) and lets
+    list/search endpoints like ``asana.search_tasks`` actually deliver
+    their multi-candidate context into the subagent message.
+
+    The ``resume_reused`` flag prefixes the line with a ``[resume:reused]``
+    marker so the operator can spot when a step's tool call was rehydrated
+    from a prior run rather than freshly executed (4.7 finding 4
+    idempotency).
+    """
+    suffix = " [resume:reused]" if resume_reused else ""
+    return (
+        f"  - {tool_name} ({action_surface}) "
+        f"→ {status}{suffix}: {result_summary}"
+    )
+
+
 def _blocker_record(*, phase: str, reason: str, **extra: Any) -> dict[str, Any]:
     """Build a signed blocker record for `SupervisorRun.blockers`.
 
@@ -1340,8 +1372,12 @@ def run_supervisor(
                 dry_run=dry_run,
             )
             tool_summaries.append(
-                f"  - {tool_result.tool_name} ({tool_result.action_surface}) "
-                f"→ {tool_result.status}: {tool_result.result_summary[:200]}"
+                _format_tool_summary_line(
+                    tool_result.tool_name,
+                    tool_result.action_surface,
+                    tool_result.status,
+                    tool_result.result_summary,
+                )
             )
             _emit(tool_result.signed_message)
             if tool_result.status == TOOL_STATUS_OK:
@@ -1997,9 +2033,13 @@ def resume_supervisor(
                 prior_signed = persisted_tc["signed_message"]
                 prior_summary = persisted_tc["result_summary"] or ""
                 tool_summaries.append(
-                    f"  - {persisted_tc['tool_name']} "
-                    f"({persisted_tc['action_surface']}) → "
-                    f"{prior_status} [resume:reused]: {prior_summary[:200]}"
+                    _format_tool_summary_line(
+                        persisted_tc["tool_name"],
+                        persisted_tc["action_surface"],
+                        prior_status,
+                        prior_summary,
+                        resume_reused=True,
+                    )
                 )
                 if prior_status == "ok":
                     continue
@@ -2069,8 +2109,12 @@ def resume_supervisor(
                 dry_run=dry_run,
             )
             tool_summaries.append(
-                f"  - {tool_result.tool_name} ({tool_result.action_surface}) "
-                f"→ {tool_result.status}: {tool_result.result_summary[:200]}"
+                _format_tool_summary_line(
+                    tool_result.tool_name,
+                    tool_result.action_surface,
+                    tool_result.status,
+                    tool_result.result_summary,
+                )
             )
             _emit(tool_result.signed_message)
             if tool_result.status == TOOL_STATUS_OK:

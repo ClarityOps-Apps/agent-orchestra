@@ -805,6 +805,19 @@ def _filesystem_path_allowed(raw_path: str) -> tuple[bool, str, Path | None]:
     root = orchestra_root()
     candidate = Path(raw_path)
     if not candidate.is_absolute():
+        # Atlas adjudication 1215508295203221 finding 2: planners and
+        # operators naturally write repo-style paths ("runtime/status.py")
+        # even when the cwd is already runtime/, so the relative resolve
+        # used to double the segment
+        # (runtime → runtime/runtime/status.py). Strip a single redundant
+        # leading root-name component before the join so the path lands
+        # at the right place. Deny checks run AFTER normalization so
+        # ``runtime/.env``, ``runtime/memory/sessions.db``,
+        # ``runtime/memory/audit/...``, traversal, and denied extensions
+        # are still refused.
+        parts = candidate.parts
+        if len(parts) > 1 and parts[0] == root.name:
+            candidate = Path(*parts[1:])
         candidate = root / candidate
     try:
         # ``resolve(strict=False)`` lets us check would-be paths for
@@ -1270,8 +1283,33 @@ def _redact_args(args: Mapping[str, Any]) -> str:
     return redact(payload)
 
 
-def _summarize_result(result: Any, max_chars: int = 400) -> str:
-    """Format a result body for the signed message and persisted summary."""
+#: Default result-summary budget for tools whose output is noisy/free-form
+#: (file content, command stdout, single-record reads). Conservative on
+#: purpose: secrets-redact runs first, then we slice.
+DEFAULT_TOOL_SUMMARY_MAX_CHARS = 400
+
+#: Per-tool result-summary budget overrides. Tools whose output is a
+#: structured candidate list (Asana search, GitHub PR list) need enough
+#: budget to preserve at least the gid/name of every candidate so the
+#: subagent can disambiguate without re-querying. Atlas adjudication
+#: 1215508295203221 finding 1: at 400 chars, ``asana.search_tasks`` cut
+#: mid-second-candidate during 4.10 UAT (`run 43b05ec8…`), blocking
+#: Scribe's downstream ``asana.add_comment``. 2000 chars holds ~10 task
+#: candidates worth of JSON without losing redaction-before-cap safety.
+TOOL_SUMMARY_BUDGETS: dict[str, int] = {
+    "asana.search_tasks": 2000,
+    "github.list_prs": 2000,
+}
+
+
+def _summarize_result(result: Any, max_chars: int = DEFAULT_TOOL_SUMMARY_MAX_CHARS) -> str:
+    """Format a result body for the signed message and persisted summary.
+
+    Redact-before-cap: the secrets pass runs against the full serialized
+    text BEFORE the length cap, so a secret-shaped token straddling the
+    cap boundary cannot leak as a partial substring. Same safety property
+    the 4.8 ``_redact_and_cap`` helper enforces for the event feed.
+    """
     if result is None:
         return ""
     if isinstance(result, str):
@@ -1285,6 +1323,19 @@ def _summarize_result(result: Any, max_chars: int = 400) -> str:
     if len(redacted) > max_chars:
         return redacted[:max_chars] + "...[truncated]"
     return redacted
+
+
+def _summarize_for_tool(result: Any, tool_name: str) -> str:
+    """Summarize ``result`` using the per-tool budget when one is set.
+
+    Looks up ``TOOL_SUMMARY_BUDGETS[tool_name]`` (falling back to
+    ``DEFAULT_TOOL_SUMMARY_MAX_CHARS`` when no override exists) and routes
+    through ``_summarize_result`` so the redact-before-cap order is
+    preserved at every call site. Atlas adjudication 1215508295203221
+    finding 1.
+    """
+    cap = TOOL_SUMMARY_BUDGETS.get(tool_name, DEFAULT_TOOL_SUMMARY_MAX_CHARS)
+    return _summarize_result(result, max_chars=cap)
 
 
 # --- The hook chain ----------------------------------------------------------
@@ -1690,7 +1741,15 @@ def execute_tool(
         _persist_tool_call(store, result, request=request)
         return result
 
-    summary = _summarize_result(raw_result)
+    # Atlas adjudication 1215508295203221 finding 1: per-tool summary
+    # budget routes through ``_summarize_for_tool`` so list/search
+    # endpoints (e.g. asana.search_tasks at 2000 chars) preserve every
+    # candidate's gid/name intact into ``result_summary``. The
+    # signed-message preview keeps the existing 200-char compact display
+    # for the signed line itself; the full ``summary`` lands in the
+    # persisted ``result_summary`` column and in the supervisor's
+    # subagent-message tool-results block.
+    summary = _summarize_for_tool(raw_result, spec.tool_name)
     signed = sign_action(
         canonical_agent,
         f"Tool ok: {spec.tool_name} (surface={resolved_surface}). "
@@ -2201,6 +2260,203 @@ def _dry_run() -> int:
             ok,
             f"row tool_call_id={rows[0]['tool_call_id'] if rows else None}",
         )
+
+    # --- 4.10 addendum (Asana 1215508295203221) scenarios -------------------
+
+    # B1. asana.search_tasks per-tool budget — synthetic multi-candidate
+    # search result must survive intact under the per-tool 2000-char cap.
+    # The prior global 400-char default cut mid-second-candidate during
+    # the 4.10 UAT (run_id 43b05ec8-…), blocking Scribe's downstream
+    # asana.add_comment. With the budget raised to 2000, a realistic
+    # 10-candidate response fits comfortably and every gid+name survives.
+    synthetic_search = {
+        "body": {
+            "data": [
+                {
+                    "gid": f"121540000000{i:04d}",
+                    "name": f"M4 v3 · 4.{i} — synthetic task candidate {i}",
+                    "resource_type": "task",
+                    "resource_subtype": "default_task",
+                }
+                for i in range(10)
+            ]
+        },
+        "status": 200,
+    }
+    summary_400 = _summarize_for_tool(synthetic_search, "asana.get_task")
+    summary_2000 = _summarize_for_tool(synthetic_search, "asana.search_tasks")
+    # Every candidate's gid must survive into the asana.search_tasks summary.
+    every_gid_present = all(
+        f"121540000000{i:04d}" in summary_2000 for i in range(10)
+    )
+    # The asana.get_task (default budget) path still truncates as before.
+    get_task_truncated = summary_400.endswith("...[truncated]")
+    # Per-tool budget ordering: asana.search_tasks > asana.get_task.
+    budget_lookup = (
+        TOOL_SUMMARY_BUDGETS["asana.search_tasks"] == 2000
+        and TOOL_SUMMARY_BUDGETS.get("asana.get_task", DEFAULT_TOOL_SUMMARY_MAX_CHARS)
+        == DEFAULT_TOOL_SUMMARY_MAX_CHARS
+    )
+    record(
+        "addendum-asana-search-budget-multi-candidate",
+        every_gid_present and get_task_truncated and budget_lookup,
+        f"every_gid_present={every_gid_present}, "
+        f"get_task_truncated={get_task_truncated}, "
+        f"summary_2000_len={len(summary_2000)}, "
+        f"budget_lookup_ok={budget_lookup}",
+    )
+
+    # B2. Secret straddling the 2000-char cap — synthetic ``sk-proj-…``
+    # is positioned so its bytes span the cap boundary. Under
+    # redact-before-cap (correct), ``redact()`` fires on the full input
+    # first and the whole token is replaced by ``[REDACTED:openai_api_key]``
+    # BEFORE the slice, so neither raw token nor any leading partial of
+    # it can leak. Under cap-before-redact (broken), the slice would land
+    # mid-token and yield a 10-char partial that no longer matches the
+    # secret regex.
+    boundary_token = "sk-proj-RRRRRRRRRRRRRRRRRRRR"
+    # Build the candidate list so the secret-shaped token straddles
+    # ~position 1990 (in the redact window, well before the 2000-char
+    # cap) AND the payload after the token is long enough that the cap
+    # actually has to fire. Without the cap firing the test would prove
+    # only redaction, not order. The boundary candidate sits at index
+    # ``before_count`` so the token text lands in the right window;
+    # ``after_count`` adds enough trailing filler to overshoot the cap.
+    asana_cap = TOOL_SUMMARY_BUDGETS["asana.search_tasks"]
+    boundary_candidate = {"g": "B", "n": f"pre {boundary_token} post"}
+
+    def _synth(before_count: int, after_count: int) -> dict[str, Any]:
+        before = [
+            {"g": f"a{i:04d}", "n": "y" * 20} for i in range(before_count)
+        ]
+        after = [
+            {"g": f"z{i:04d}", "n": "w" * 20} for i in range(after_count)
+        ]
+        return {"body": {"data": before + [boundary_candidate] + after}}
+
+    # 38 candidates of ~50 chars each → token lands at position ~1900.
+    before_count = 38
+    after_count = 30
+    synthetic_with_secret = _synth(before_count, after_count)
+    raw_payload = json.dumps(
+        synthetic_with_secret, sort_keys=True, ensure_ascii=False, default=str
+    )
+    # Tune so the token sits below the cap and the payload exceeds it.
+    while (
+        raw_payload.find(boundary_token) > asana_cap - 50
+        and before_count > 5
+    ):
+        before_count -= 2
+        synthetic_with_secret = _synth(before_count, after_count)
+        raw_payload = json.dumps(
+            synthetic_with_secret, sort_keys=True, ensure_ascii=False, default=str
+        )
+    while len(raw_payload) < asana_cap + 100 and after_count < 200:
+        after_count += 10
+        synthetic_with_secret = _synth(before_count, after_count)
+        raw_payload = json.dumps(
+            synthetic_with_secret, sort_keys=True, ensure_ascii=False, default=str
+        )
+    boundary_summary = _summarize_for_tool(synthetic_with_secret, "asana.search_tasks")
+    # The full input JSON length minus the cap tells us whether the token
+    # straddles the boundary; the safety property below is what we test.
+    partial_substrings = [boundary_token[:n] for n in (10, 12, 16, 20)]
+    no_partials = all(p not in boundary_summary for p in partial_substrings)
+    redact_fired = "[REDACTED:openai_api_key]" in boundary_summary
+    # Position invariant: the unredacted full payload is longer than the
+    # cap (so the cap fires) AND the token lands within the redact-pass
+    # window (so we are actually testing the order, not just clipping
+    # the token away).
+    raw_payload_len = len(raw_payload)
+    token_pos_in_raw = raw_payload.find(boundary_token)
+    test_position_valid = (
+        raw_payload_len > asana_cap
+        and 0 < token_pos_in_raw < asana_cap
+    )
+    record(
+        "addendum-asana-search-secret-redact-before-cap",
+        test_position_valid
+        and boundary_token not in boundary_summary
+        and no_partials
+        and redact_fired,
+        f"len={len(boundary_summary)}, raw_len={raw_payload_len}, "
+        f"token_pos={token_pos_in_raw}, "
+        f"raw_token_survived={boundary_token in boundary_summary}, "
+        f"partial_survived={not no_partials}, "
+        f"redact_fired={redact_fired}",
+    )
+
+    # B3. Filesystem path normalization — `runtime/X` lands at
+    # `<ORCHESTRA_ROOT>/X`, not the prior doubled
+    # `<ORCHESTRA_ROOT>/runtime/X`. Uses a tempdir as ORCHESTRA_ROOT so
+    # the test does not touch the real repo or VPS layout.
+    with tempfile.TemporaryDirectory(prefix="orchestra-fs-norm-") as tmp:
+        # Set the root name to "runtime" so the normalization matches the
+        # planner's repo-style "runtime/X" path. Use a nested directory
+        # whose basename is literally "runtime".
+        root_dir = Path(tmp) / "runtime"
+        root_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["ORCHESTRA_ROOT"] = str(root_dir)
+        try:
+            allowed, reason, resolved = _filesystem_path_allowed(
+                "runtime/UAT_demo.md"
+            )
+            expected = (root_dir / "UAT_demo.md").resolve()
+            normalized_ok = (
+                allowed
+                and resolved == expected
+                # The PRIOR-buggy path would land at root/runtime/UAT_demo.md.
+                and resolved != (root_dir / "runtime" / "UAT_demo.md").resolve()
+            )
+
+            # Bare filename still works.
+            allowed_bare, _, resolved_bare = _filesystem_path_allowed(
+                "UAT_demo.md"
+            )
+            bare_ok = allowed_bare and resolved_bare == expected
+
+            # Nested project file resolves under root (no double-prefix).
+            allowed_nested, _, resolved_nested = _filesystem_path_allowed(
+                "runtime/llm/agent_factory.py"
+            )
+            nested_expected = (root_dir / "llm" / "agent_factory.py").resolve()
+            nested_ok = allowed_nested and resolved_nested == nested_expected
+
+            record(
+                "addendum-fs-runtime-prefix-normalization",
+                normalized_ok and bare_ok and nested_ok,
+                f"normalized_ok={normalized_ok}, bare_ok={bare_ok}, "
+                f"nested_ok={nested_ok}",
+            )
+
+            # B4. Deny-list stays strict AFTER normalization — `runtime/.env`,
+            # `runtime/memory/audit/...`, `runtime/memory/sessions.db`,
+            # denied extensions, and traversal must still all block.
+            deny_cases = (
+                ("runtime/.env", "deny path '.env'"),
+                ("runtime/.venv", "deny path '.venv'"),
+                ("runtime/.venv/marker.txt", "deny path '.venv'"),
+                ("runtime/memory/audit", "deny path 'memory/audit'"),
+                ("runtime/memory/audit/2026-06-08.md", "deny path 'memory/audit'"),
+                ("runtime/memory/sessions.db", "deny path 'memory/sessions.db'"),
+                ("runtime/some.db-wal", "denied extension"),
+                ("runtime/../../etc/passwd", "path traversal"),
+            )
+            deny_failures: list[str] = []
+            for raw_path, expected_marker in deny_cases:
+                allowed_d, reason_d, _ = _filesystem_path_allowed(raw_path)
+                if allowed_d or expected_marker not in reason_d:
+                    deny_failures.append(
+                        f"{raw_path!r}: allowed={allowed_d}, reason={reason_d[:80]!r}"
+                    )
+            record(
+                "addendum-fs-runtime-prefix-deny-still-strict",
+                not deny_failures,
+                f"failures={deny_failures}" if deny_failures
+                else f"all {len(deny_cases)} deny cases blocked after normalization",
+            )
+        finally:
+            os.environ.pop("ORCHESTRA_ROOT", None)
 
     for case in passes:
         pass
