@@ -59,6 +59,121 @@ python orchestra.py --self-test           # hook smoke checks
 python orchestra.py --daemon --interval N # long-lived heartbeat (systemd unit)
 ```
 
+## REST API (M4 4.11)
+
+`runtime/api.py` is the FastAPI surface backing the M5 Retool flight deck.
+It composes with the existing supervisor / session_store / tool_registry
+rather than duplicating them — the same code path the CLI runs serves
+the REST endpoints, so signed activity, redaction, gate semantics, and
+schema discipline stay in one place. Source of truth for the design:
+`08-FLIGHT-DECK-PRD.md` v0.3, `07-PHASE-1-SCOPE-OF-WORK.md` v3.1, and
+Atlas's 4.11 directive (Asana comment `1215607965656701`).
+
+### Local run
+
+```bash
+# Self-test against a fresh temp DB — exercises every endpoint group,
+# auth, project persistence, run snapshot serialization, SSE, halt,
+# cost estimate, gate persistence, and token redaction. No provider /
+# network calls.
+uv run python -m api --dry-run
+
+# Bind uvicorn locally (loopback by default).
+ORCHESTRA_API_TOKEN=$(cat /path/to/local-only-token) \
+  uv run python -m api --serve --host 127.0.0.1 --port 8765
+
+# Auto-generated docs (Swagger + OpenAPI schema) under /docs and
+# /openapi.json once the server is up.
+```
+
+### Authentication
+
+MVP single-user bearer auth per PRD Q4 lock.
+
+- Set `ORCHESTRA_API_TOKEN` in `runtime/.env` or the process env.
+- All protected endpoints require `Authorization: Bearer <token>`.
+- When `ORCHESTRA_API_TOKEN` is **absent**, protected endpoints fail
+  closed with `503 auth_unavailable` — they do NOT silently allow
+  access. Health (`GET /health`) and OpenAPI docs remain public.
+- Real token generation + Retool secret handoff is **M5 task 5.2**, not
+  4.11. The API ships with the bearer scaffold and refuses to operate
+  without a configured token.
+
+### Endpoint groups
+
+| Group | Endpoints |
+|---|---|
+| Health | `GET /health` (public) |
+| Projects | `GET /projects`, `POST /projects`, `GET /projects/{id}`, `PATCH /projects/{id}` |
+| Directives & Runs | `POST /projects/{id}/directive?dry_run=`, `GET /projects/{id}/runs`, `GET /projects/{id}/runs/{run_id}`, `GET /.../stream` (SSE), `POST /.../halt`, `GET /.../preview`, `GET /.../cost_estimate` |
+| Gates | `POST /.../gates/{gate_id}/approve`, `POST /.../gates/{gate_id}/reject` |
+| Agents | `GET /projects/{id}/agents` |
+| Integrations | `GET /projects/{id}/integrations`, `POST /.../{type}/auth`, `DELETE /.../{type}` |
+| Artifact Preview | `GET /projects/{id}/runs/{run_id}/artifacts/{artifact_id}/diff` |
+
+Every protected response is JSON; every signed line in the persisted
+runtime (planner content, step messages, tool-call summaries, decision
+records, gate envelopes) is surfaced verbatim in the run-detail and SSE
+payloads.
+
+### Background runs + halt semantics
+
+- `POST /projects/{id}/directive` returns a `202 Accepted` with a
+  freshly-minted `run_id` / `session_id` immediately. The supervisor
+  runs in a daemon thread against the same row; the operator can
+  follow progress via `GET /runs/{run_id}` snapshots or the SSE
+  stream.
+- `POST /runs/{run_id}/halt` persists a signed
+  `api_halt_request` decision and sets a per-run halt flag. The
+  supervisor checks the flag at every safe boundary (between steps and
+  before the finalizer) and halts with a signed
+  `api_halt_requested_pre_step` / `_pre_finalizer` blocker. Mid-provider
+  call interruption is **NOT** supported in MVP — the run halts at the
+  next safe boundary.
+
+### Gate approve/reject
+
+- Approving records a signed human decision plus updates the gate row
+  to `approved`. It returns
+  `approved_recorded_execution_not_resumed` because safely resuming a
+  halted human-approved-only tool call would need raw-arg persistence
+  (potentially secret-bearing). The operator's signed approval is
+  durable; M5+ owns the live continue surface.
+- Rejecting records a signed `reject_recorded` decision.
+
+### Cost estimate
+
+- Deterministic heuristic (no billing API). Token estimate ≈
+  `len(directive) / 4` × planner overhead; output ≈ input × 2; cost
+  via the per-agent pricing constants in `COST_ESTIMATE_PRICING`
+  (Atlas/Cody/Scribe-Scout).
+- Returns a low/high band, the approval threshold, and a
+  `requires_approval` flag.
+
+### M5 Retool handoff notes
+
+- M5 task 5.1 onwards configures Retool to call this API. The 4.11
+  surface is the contract; Retool clicks should never need code-level
+  changes to the runtime.
+- M5 task 5.2 owns token generation, rotation, and the secret handoff
+  into Retool's vault. **Never** commit a real bearer token or echo
+  one through the API.
+- The Retool app should bind to `/health` for connection status, then
+  hold the bearer token in its secret manager and pass it on every
+  protected call.
+
+### Schema v3
+
+- Adds the `projects` table and a nullable `sessions.project_id`
+  column (4.11 migration).
+- Existing v1/v2 databases auto-upgrade on first `ensure_schema()` —
+  the ALTER is guarded by a `PRAGMA table_info(sessions)` check so it
+  runs exactly once.
+- Legacy CLI sessions (4.6 / 4.8) with `project_id=NULL` keep loading
+  fine; the API surfaces them under a sentinel `unscoped_legacy_sessions`
+  count on `GET /projects` and never mixes them into a project's run
+  list.
+
 ## Runtime health-check (M4 4.9)
 
 A tiny stdlib-only health surface lives at `runtime/status.py`. Two CLI shapes:

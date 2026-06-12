@@ -71,7 +71,16 @@ from hooks.secrets_check import find_secrets, redact
 #:           access. Existing v1 databases auto-upgrade on first
 #:           ``ensure_schema()`` call via the ``IF NOT EXISTS`` DDL plus
 #:           a ``PRAGMA user_version`` bump.
-SCHEMA_VERSION = 2
+#: v3 (4.11): adds ``projects`` table for the REST API + flight-deck
+#:           project model AND a nullable ``project_id`` column on
+#:           ``sessions`` so API-submitted runs can be scoped per project
+#:           without breaking historical CLI sessions whose
+#:           ``project_id`` stays NULL. ``Agent Orchestra`` itself is
+#:           NOT seeded as a project — the platform is the flight deck
+#:           and the projects table holds the operator's product
+#:           initiatives (see ``08-FLIGHT-DECK-PRD.md`` v0.3 product
+#:           model lock).
+SCHEMA_VERSION = 3
 
 #: Runtime root (one level up from this file). Default DB path lives at
 #: ``runtime/memory/sessions.db``, already covered by the
@@ -108,13 +117,35 @@ VALID_PHASES: frozenset[str] = frozenset(
     {PHASE_PLANNER, PHASE_STEP, PHASE_FINALIZER, PHASE_BLOCKER}
 )
 
-#: Gate lifecycle states. 4.6 only writes ``pending``; 4.11 will own the
-#: resolution transitions.
+#: Gate lifecycle states. 4.6 only writes ``pending``; 4.11 owns the
+#: resolution transitions via the REST API gate endpoints.
 GATE_STATUS_PENDING = "pending"
 GATE_STATUS_APPROVED = "approved"
 GATE_STATUS_REJECTED = "rejected"
 VALID_GATE_STATUSES: frozenset[str] = frozenset(
     {GATE_STATUS_PENDING, GATE_STATUS_APPROVED, GATE_STATUS_REJECTED}
+)
+
+#: Project lifecycle states (4.11). Matches the operator vocabulary in
+#: ``08-FLIGHT-DECK-PRD.md`` v0.3 §"Project Lifecycle States". Persisted as
+#: a free-form TEXT column rather than a CHECK constraint so M5/M6 can
+#: refine the taxonomy without a schema migration; the API layer
+#: validates against this set at the request boundary.
+PROJECT_STATE_GREENFIELD = "greenfield"
+PROJECT_STATE_DEVELOPMENT = "development"
+PROJECT_STATE_MAINTENANCE = "maintenance"
+PROJECT_STATE_AUDIT = "audit"
+PROJECT_STATE_MONITORING = "monitoring"
+PROJECT_STATE_ARCHIVED = "archived"
+VALID_PROJECT_STATES: frozenset[str] = frozenset(
+    {
+        PROJECT_STATE_GREENFIELD,
+        PROJECT_STATE_DEVELOPMENT,
+        PROJECT_STATE_MAINTENANCE,
+        PROJECT_STATE_AUDIT,
+        PROJECT_STATE_MONITORING,
+        PROJECT_STATE_ARCHIVED,
+    }
 )
 
 #: Tool-call lifecycle states. Mirrors ``runtime.tool_registry``'s
@@ -272,6 +303,27 @@ _SCHEMA_DDL: tuple[str, ...] = (
         FOREIGN KEY (run_id) REFERENCES sessions(run_id) ON DELETE CASCADE
     )
     """,
+    # 4.11 — projects table backing the REST API + flight-deck multi-project
+    # model. Garrett-owned columns (``name``, ``vision``, ``repo_urls``)
+    # may be supplied by the operator at create time; ``asana_project_gid``
+    # is optional because greenfield creation may produce a project record
+    # whose Asana container is not yet linked. ``archived`` is a soft-delete
+    # flag so historical runs remain queryable. ``Agent Orchestra`` itself
+    # is NOT seeded as a project — that's the platform.
+    """
+    CREATE TABLE IF NOT EXISTS projects (
+        project_id          TEXT    PRIMARY KEY,
+        name                TEXT    NOT NULL,
+        lifecycle_state     TEXT    NOT NULL,
+        vision              TEXT,
+        asana_project_gid   TEXT,
+        repo_urls_json      TEXT    NOT NULL DEFAULT '[]',
+        archived            INTEGER NOT NULL DEFAULT 0,
+        created_at          TEXT    NOT NULL,
+        updated_at          TEXT    NOT NULL,
+        metadata_json       TEXT    NOT NULL DEFAULT '{}'
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_at)",
@@ -282,12 +334,16 @@ _SCHEMA_DDL: tuple[str, ...] = (
     # Used by ``load_tool_call_for_step`` on the resume path to look up
     # idempotency keys without scanning the whole table.
     "CREATE INDEX IF NOT EXISTS idx_tool_calls_resume_key ON tool_calls(run_id, step_id, step_call_index)",
+    # 4.11 — project-scoped browse indexes.
+    "CREATE INDEX IF NOT EXISTS idx_projects_archived_created ON projects(archived, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_projects_asana_gid ON projects(asana_project_gid)",
 )
 
 
 _MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, "initial schema: sessions, messages, actions, gates, decisions"),
     (2, "tool_calls table for supervisor-mediated MCP/tool access (4.7)"),
+    (3, "projects table + sessions.project_id column (4.11 REST API)"),
 )
 
 
@@ -391,6 +447,34 @@ class PersistedSession:
     plan: dict[str, Any] | None
     error_count: int
     blocker_count: int
+    #: 4.11 — project the run was submitted under, or ``None`` for legacy
+    #: CLI sessions that pre-date the multi-project model. The REST API
+    #: scopes its run views by project_id; ``None`` is surfaced under a
+    #: sentinel "unscoped" group rather than silently appearing in every
+    #: project's list.
+    project_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PersistedProject:
+    """A ``projects`` row, decoded into a typed snapshot.
+
+    The REST API in ``runtime/api.py`` consumes these directly. ``repo_urls``
+    and ``metadata`` are decoded from the persisted JSON blobs so callers
+    don't have to re-parse them. ``archived`` is exposed as a real bool
+    rather than the int storage form.
+    """
+
+    project_id: str
+    name: str
+    lifecycle_state: str
+    vision: str | None
+    asana_project_gid: str | None
+    repo_urls: tuple[str, ...]
+    archived: bool
+    created_at: datetime
+    updated_at: datetime
+    metadata: dict[str, Any]
 
 
 # --- The store ---------------------------------------------------------------
@@ -467,6 +551,10 @@ class SessionStore:
         with self.transaction() as conn:
             for ddl in _SCHEMA_DDL:
                 conn.execute(ddl)
+            # 4.11 schema v3: ``sessions.project_id`` is added via ALTER
+            # because SQLite has no ``IF NOT EXISTS`` for ADD COLUMN. The
+            # column is nullable so historical v1/v2 rows continue to load.
+            self._ensure_sessions_project_id_column(conn)
             current = conn.execute("PRAGMA user_version").fetchone()[0]
             applied_at = _utc_now_iso()
             for version, description in _MIGRATIONS:
@@ -478,6 +566,24 @@ class SessionStore:
                     )
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         return SCHEMA_VERSION
+
+    @staticmethod
+    def _ensure_sessions_project_id_column(conn: sqlite3.Connection) -> None:
+        """Add ``sessions.project_id`` if it isn't there yet.
+
+        Idempotent: inspects ``PRAGMA table_info(sessions)`` and only runs
+        the ALTER when the column is missing. Existing v1/v2 rows keep
+        ``project_id=NULL`` and remain queryable by the legacy CLI; the
+        REST API surfaces them under an unscoped sentinel rather than
+        silently mixing into every project's run list.
+        """
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+        if "project_id" not in cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN project_id TEXT")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_project_id "
+                "ON sessions(project_id, created_at DESC)"
+            )
 
     def ensure_schema(self) -> int:
         """Synonym for ``init_db()`` for callers that prefer the name."""
@@ -501,8 +607,15 @@ class SessionStore:
         max_steps: int,
         dry_run: bool,
         created_at: datetime,
+        project_id: str | None = None,
     ) -> None:
-        """Insert (or upsert) the initial session row."""
+        """Insert (or upsert) the initial session row.
+
+        ``project_id`` is 4.11-only; the CLI path passes ``None`` and the
+        column stays NULL so the existing 4.8 behavior is byte-for-byte
+        preserved. The REST API in ``runtime/api.py`` passes the
+        project's stable id so the run can be scoped per project.
+        """
         now = _iso(created_at) or _utc_now_iso()
         with self.transaction() as conn:
             conn.execute(
@@ -511,15 +624,16 @@ class SessionStore:
                     run_id, session_id, directive_summary, status, max_steps,
                     dry_run, created_at, updated_at,
                     completed_at, planner_envelope_id, finalizer_envelope_id,
-                    plan_json, error_count, blocker_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, 0)
+                    plan_json, error_count, blocker_count, project_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, 0, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                     session_id = excluded.session_id,
                     directive_summary = excluded.directive_summary,
                     status = excluded.status,
                     max_steps = excluded.max_steps,
                     dry_run = excluded.dry_run,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    project_id = COALESCE(excluded.project_id, sessions.project_id)
                 """,
                 (
                     run_id,
@@ -530,6 +644,7 @@ class SessionStore:
                     1 if dry_run else 0,
                     now,
                     now,
+                    project_id,
                 ),
             )
 
@@ -926,6 +1041,15 @@ class SessionStore:
         if row is None:
             return None
         plan = json.loads(row["plan_json"]) if row["plan_json"] else None
+        # 4.11 v3: ``project_id`` column may be missing on a row written
+        # before the migration. Defensive ``row.keys()`` check keeps the
+        # rehydrate path working against a v2 database that hasn't been
+        # touched by init_db yet.
+        project_id = (
+            row["project_id"]
+            if "project_id" in row.keys()
+            else None
+        )
         return PersistedSession(
             run_id=row["run_id"],
             session_id=row["session_id"],
@@ -941,21 +1065,227 @@ class SessionStore:
             plan=plan,
             error_count=int(row["error_count"]),
             blocker_count=int(row["blocker_count"]),
+            project_id=project_id,
         )
 
-    def list_sessions(self, *, limit: int = 50) -> list[PersistedSession]:
-        """Return the most recent sessions."""
+    def list_sessions(
+        self,
+        *,
+        limit: int = 50,
+        project_id: str | None = None,
+        unscoped_only: bool = False,
+    ) -> list[PersistedSession]:
+        """Return the most recent sessions.
+
+        ``project_id`` filters to runs owned by exactly that project.
+        ``unscoped_only`` returns only the legacy NULL-project runs
+        (4.8 CLI sessions that pre-date schema v3). The two flags are
+        mutually exclusive; passing both raises ``SessionStoreError``.
+        Default behavior (both None / False) is unchanged from 4.6/4.8.
+        """
+        if project_id is not None and unscoped_only:
+            raise SessionStoreError(
+                "list_sessions: project_id and unscoped_only are mutually exclusive"
+            )
         with self.connection() as conn:
-            rows = conn.execute(
-                "SELECT run_id FROM sessions ORDER BY created_at DESC LIMIT ?",
-                (int(limit),),
-            ).fetchall()
+            if project_id is not None:
+                rows = conn.execute(
+                    "SELECT run_id FROM sessions WHERE project_id = ? "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (project_id, int(limit)),
+                ).fetchall()
+            elif unscoped_only:
+                rows = conn.execute(
+                    "SELECT run_id FROM sessions WHERE project_id IS NULL "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (int(limit),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT run_id FROM sessions ORDER BY created_at DESC LIMIT ?",
+                    (int(limit),),
+                ).fetchall()
         sessions: list[PersistedSession] = []
         for row in rows:
             session = self.load_session(row["run_id"])
             if session is not None:
                 sessions.append(session)
         return sessions
+
+    # --- writes/reads: projects (4.11) -------------------------------------
+
+    def record_project(
+        self,
+        *,
+        project_id: str,
+        name: str,
+        lifecycle_state: str,
+        vision: str | None = None,
+        asana_project_gid: str | None = None,
+        repo_urls: tuple[str, ...] | list[str] | None = None,
+        archived: bool = False,
+        metadata: dict[str, Any] | None = None,
+        created_at: datetime | None = None,
+    ) -> None:
+        """Insert (or upsert) a project row.
+
+        ``Agent Orchestra`` itself is NOT a project — the platform is the
+        flight deck and this table holds the operator's product
+        initiatives. Validation of the ``name``/``lifecycle_state``
+        domain lives at the REST API request boundary; this method is the
+        durable write surface and accepts whatever the caller validates
+        upstream.
+        """
+        if lifecycle_state not in VALID_PROJECT_STATES:
+            raise SessionStoreError(
+                f"record_project: unknown lifecycle_state {lifecycle_state!r}; "
+                f"valid {sorted(VALID_PROJECT_STATES)}"
+            )
+        now = _iso(created_at) or _utc_now_iso()
+        repo_list = list(repo_urls or ())
+        repo_blob = json.dumps(repo_list, sort_keys=False, ensure_ascii=False)
+        meta_blob = _dump_metadata(metadata or {})
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO projects (
+                    project_id, name, lifecycle_state, vision,
+                    asana_project_gid, repo_urls_json, archived,
+                    created_at, updated_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                    name = excluded.name,
+                    lifecycle_state = excluded.lifecycle_state,
+                    vision = excluded.vision,
+                    asana_project_gid = excluded.asana_project_gid,
+                    repo_urls_json = excluded.repo_urls_json,
+                    archived = excluded.archived,
+                    updated_at = excluded.updated_at,
+                    metadata_json = excluded.metadata_json
+                """,
+                (
+                    project_id,
+                    _safe_text(name) or "",
+                    lifecycle_state,
+                    _safe_text(vision),
+                    asana_project_gid,
+                    repo_blob,
+                    1 if archived else 0,
+                    now,
+                    now,
+                    meta_blob,
+                ),
+            )
+
+    def update_project(
+        self,
+        project_id: str,
+        *,
+        name: str | None = None,
+        lifecycle_state: str | None = None,
+        vision: str | None = None,
+        asana_project_gid: str | None = None,
+        repo_urls: tuple[str, ...] | list[str] | None = None,
+        archived: bool | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Partial-update a project row. ``None`` fields are left alone.
+
+        ``lifecycle_state`` is validated against ``VALID_PROJECT_STATES``
+        at the boundary so a typo cannot land in the column.
+        """
+        if lifecycle_state is not None and lifecycle_state not in VALID_PROJECT_STATES:
+            raise SessionStoreError(
+                f"update_project: unknown lifecycle_state {lifecycle_state!r}; "
+                f"valid {sorted(VALID_PROJECT_STATES)}"
+            )
+        sets: list[str] = ["updated_at = ?"]
+        params: list[Any] = [_utc_now_iso()]
+        if name is not None:
+            sets.append("name = ?")
+            params.append(_safe_text(name) or "")
+        if lifecycle_state is not None:
+            sets.append("lifecycle_state = ?")
+            params.append(lifecycle_state)
+        if vision is not None:
+            sets.append("vision = ?")
+            params.append(_safe_text(vision))
+        if asana_project_gid is not None:
+            sets.append("asana_project_gid = ?")
+            params.append(asana_project_gid)
+        if repo_urls is not None:
+            sets.append("repo_urls_json = ?")
+            params.append(
+                json.dumps(list(repo_urls), sort_keys=False, ensure_ascii=False)
+            )
+        if archived is not None:
+            sets.append("archived = ?")
+            params.append(1 if archived else 0)
+        if metadata is not None:
+            sets.append("metadata_json = ?")
+            params.append(_dump_metadata(metadata))
+        params.append(project_id)
+        with self.transaction() as conn:
+            conn.execute(
+                f"UPDATE projects SET {', '.join(sets)} WHERE project_id = ?",
+                params,
+            )
+
+    def load_project(self, project_id: str) -> PersistedProject | None:
+        """Return a single project by id, or ``None`` when absent."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM projects WHERE project_id = ?", (project_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_project(row)
+
+    def list_projects(
+        self,
+        *,
+        include_archived: bool = False,
+        limit: int = 100,
+    ) -> list[PersistedProject]:
+        """Return projects ordered by recency (newest first)."""
+        with self.connection() as conn:
+            if include_archived:
+                rows = conn.execute(
+                    "SELECT * FROM projects "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (int(limit),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM projects WHERE archived = 0 "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (int(limit),),
+                ).fetchall()
+        return [self._row_to_project(row) for row in rows]
+
+    @staticmethod
+    def _row_to_project(row: sqlite3.Row) -> PersistedProject:
+        """Decode a ``projects`` row into a ``PersistedProject``."""
+        try:
+            repo_list = json.loads(row["repo_urls_json"] or "[]")
+        except json.JSONDecodeError:
+            repo_list = []
+        try:
+            meta = json.loads(row["metadata_json"] or "{}")
+        except json.JSONDecodeError:
+            meta = {}
+        return PersistedProject(
+            project_id=row["project_id"],
+            name=row["name"],
+            lifecycle_state=row["lifecycle_state"],
+            vision=row["vision"],
+            asana_project_gid=row["asana_project_gid"],
+            repo_urls=tuple(str(u) for u in repo_list if isinstance(u, str)),
+            archived=bool(row["archived"]),
+            created_at=_from_iso(row["created_at"]) or datetime.now(UTC),
+            updated_at=_from_iso(row["updated_at"]) or datetime.now(UTC),
+            metadata=meta if isinstance(meta, dict) else {},
+        )
 
     def load_messages(self, identifier: str) -> list[dict[str, Any]]:
         """Return all message rows for a run, oldest first."""

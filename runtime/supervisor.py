@@ -982,6 +982,10 @@ def run_supervisor(
     dry_run: bool = False,
     store: SessionStore | None = None,
     event_sink: Callable[[str], None] | None = None,
+    project_id: str | None = None,
+    run_id: str | None = None,
+    session_id: str | None = None,
+    halt_check: Callable[[], bool] | None = None,
     _dry_run_planner_content: str | None = None,
     _stop_after: str | None = None,
     _force_step_exception: BaseException | None = None,
@@ -1010,6 +1014,27 @@ def run_supervisor(
             via `resume_supervisor()`. When `None` (the default), the
             run is in-memory only — preserving the existing 4.5 surface
             unchanged. Task 4.6 owns this hook.
+        project_id: optional 4.11 project id to scope the persisted
+            session under. Default ``None`` keeps the legacy CLI behavior
+            (unscoped row); the REST API in ``runtime/api.py`` passes the
+            project's stable id so the run appears under that project's
+            scope. The column is nullable in schema v3.
+        run_id: optional caller-supplied run id. When ``None`` (the
+            default), the supervisor mints a fresh UUID. The REST API
+            mints the id BEFORE returning to the operator so it can hand
+            it back synchronously while the background thread executes
+            the run; passing it in here keeps the externally-visible id
+            identical to the row persisted under it.
+        session_id: same semantics as ``run_id`` but for the session
+            identifier. Defaults to a fresh UUID when not provided.
+        halt_check: optional callable invoked at phase/step boundaries.
+            When it returns ``True``, the supervisor records a signed
+            ``api_halt_requested`` blocker and finalizes with
+            ``SUPERVISOR_STATUS_BLOCKED``. The REST API uses this to honor
+            ``POST /runs/{run_id}/halt`` without unsafe thread killing —
+            the run stops at the next safe boundary (between steps or
+            before the finalizer). When ``None`` (the default), no halt
+            checking happens and behavior is unchanged from 4.8.
         _dry_run_planner_content: private dry-run-only hook. When `dry_run`
             is True and a string is provided, this becomes the synthetic
             planner envelope's pre-signature payload. Dry-run scenarios
@@ -1045,8 +1070,12 @@ def run_supervisor(
         )
 
     load_env_file()
-    run_id = _new_id()
-    session_id = _new_id()
+    # 4.11 narrow extension: accept caller-supplied run_id/session_id so the
+    # REST API can hand back the id synchronously while the background
+    # thread executes against the same row. Fall back to fresh UUIDs when
+    # callers don't supply them, preserving the 4.5/4.8 behavior.
+    run_id = run_id if run_id is not None else _new_id()
+    session_id = session_id if session_id is not None else _new_id()
     created_at = _utc_now()
     directive_summary = _summarize_directive(directive)
     max_steps_norm = _normalize_max_steps(max_steps)
@@ -1073,6 +1102,7 @@ def run_supervisor(
             max_steps=max_steps_norm,
             dry_run=dry_run,
             created_at=created_at,
+            project_id=project_id,
         )
 
     def _persist_envelope(envelope: MessageEnvelope, *, phase: str) -> None:
@@ -1349,8 +1379,43 @@ def run_supervisor(
             )
         return finalize(SUPERVISOR_STATUS_PLANNING)
 
+    # --- Halt-check helper (4.11 REST API kill switch) -----------------------
+    # When the REST API's ``POST /runs/{run_id}/halt`` endpoint persists a
+    # signed halt request, the background runner sets ``halt_check`` to a
+    # callable that returns True once the halt is observable. The
+    # supervisor calls it at every safe boundary (before each step and
+    # before the finalizer) and finalizes with ``SUPERVISOR_STATUS_BLOCKED``
+    # + a signed ``api_halt_requested`` blocker if it fires. Mid-provider
+    # call interruption is explicitly NOT supported in 4.11 (PRD note);
+    # the run halts at the next safe boundary. When ``halt_check`` is
+    # ``None`` (default — CLI/library callers) this helper is a no-op and
+    # the existing 4.8 behavior is byte-for-byte unchanged.
+    def _halt_requested() -> bool:
+        if halt_check is None:
+            return False
+        try:
+            return bool(halt_check())
+        except Exception:  # noqa: BLE001 — never let a buggy hook crash a run.
+            return False
+
+    def _record_api_halt(phase: str) -> dict[str, Any]:
+        record = _blocker_record(
+            phase=phase,
+            reason="api halt requested; stopping at next safe boundary.",
+        )
+        blockers.append(record)
+        _persist_decision(record, kind=DECISION_KIND_BLOCKER)
+        _emit(record.get("signed_message"))
+        return record
+
     # --- Step execution -------------------------------------------------------
     for step_spec in validated_steps:
+        # Honor an API-initiated halt request between steps. The run
+        # finalizes with a signed blocker and the persisted ``decisions``
+        # row makes the halt visible to ``GET /runs/{run_id}``.
+        if _halt_requested():
+            _record_api_halt("api_halt_requested_pre_step")
+            return finalize(SUPERVISOR_STATUS_BLOCKED)
         # 4.7 main scope: run any pre-step tool calls through the registry
         # before dispatching the subagent message. Each tool call is
         # already validated against agent/tool permissions in
@@ -1580,6 +1645,10 @@ def run_supervisor(
             return finalize(SUPERVISOR_STATUS_EXECUTING)
 
     # --- Finalizer turn ------------------------------------------------------
+    # Last halt-check before the (potentially expensive) finalizer call.
+    if _halt_requested():
+        _record_api_halt("api_halt_requested_pre_finalizer")
+        return finalize(SUPERVISOR_STATUS_BLOCKED)
     _emit_atlas("Finalizer start.")
     try:
         finalizer_envelope = _finalize_turn(
