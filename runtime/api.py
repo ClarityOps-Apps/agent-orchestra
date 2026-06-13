@@ -283,6 +283,40 @@ def _safe_text(value: Any) -> str:
     return redact(text) if find_secrets(text) else text
 
 
+#: Default cap for ``_redact_and_trim`` — mirrors the supervisor's
+#: ``DIRECTIVE_SUMMARY_LIMIT`` so the API and the supervisor agree on
+#: how much of a directive shows up in receipts. Tuned for the
+#: ``sessions.directive_summary`` column.
+_API_DIRECTIVE_SUMMARY_LIMIT = 200
+
+
+def _redact_and_trim(text: Any, limit: int = _API_DIRECTIVE_SUMMARY_LIMIT) -> str:
+    """Redact a free-text value FIRST, then cap to ``limit`` characters.
+
+    Atlas redaction addendum ``1215689139269811``: the prior ``_start_background_run()``
+    used ``directive[:200]`` before handing the value to ``record_session``,
+    which only re-redacts after the slice. A secret-shaped token straddling
+    the 200-char boundary would land in ``sessions.directive_summary`` as a
+    partial ``sk-proj-...`` fragment that no longer matched the secret
+    regex.
+
+    Centralizing the order in one helper makes it impossible for this site
+    (or a future sibling) to drift back to cap-then-redact. Mirrors the
+    4.8 ``orchestra._redact_and_trim`` and supervisor ``_redact_and_cap``
+    /``_summarize_directive`` patterns.
+
+    Returns the redacted-then-trimmed string. ``None`` becomes ``""`` so
+    callers don't need an extra guard.
+    """
+    if text is None:
+        return ""
+    raw = str(text)
+    redacted = redact(raw) if find_secrets(raw) else raw
+    if len(redacted) <= limit:
+        return redacted
+    return redacted[:limit] + "…[truncated]"
+
+
 # --- Pydantic models ---------------------------------------------------------
 
 
@@ -906,10 +940,19 @@ def _start_background_run(
 
     # Record the session row up-front so a GET /runs/{run_id} immediately
     # after the POST returns the seeded state rather than a 404 race.
+    #
+    # Atlas redaction addendum 1215689139269811: redact BEFORE slicing
+    # via the local ``_redact_and_trim`` helper. The prior
+    # ``directive[:200]`` form chopped any secret-shaped token straddling
+    # the 200-char cap into a partial that ``_safe_text`` could not
+    # match — surfacing through this row's ``directive_summary`` column
+    # and onwards into ``/runs/{run_id}`` snapshots and ``/runs`` list
+    # views. Same redact-before-cap discipline as the 4.8 mini-addendum
+    # and 4.7/4.10 registry findings.
     store.record_session(
         run_id=run_id,
         session_id=session_id,
-        directive_summary=directive[:200],
+        directive_summary=_redact_and_trim(directive),
         status=SUPERVISOR_STATUS_PLANNING,
         max_steps=max_steps,
         dry_run=dry_run,
@@ -2900,6 +2943,114 @@ def _dry_run() -> int:
                 f"{synthetic_wrong_token in body_text}, "
                 f"configured_token_in_body={'test-token' in body_text}, "
                 f"hmac_module_present={constant_time_in_module}",
+            )
+
+            # --- Scenario 30: directive_summary redact-before-trim
+            # boundary (Atlas redaction addendum 1215689139269811).
+            # The prior ``directive[:200]`` form in ``_start_background_run``
+            # let a secret-shaped token straddling the 200-char cap
+            # leak as a partial ``sk-proj-...`` fragment that no longer
+            # matched the secret regex. The torture string positions an
+            # ``sk-proj-...`` token so its bytes span ~position 195-223
+            # in the raw directive — token start sits below the cap so
+            # ``redact()`` MUST fire on the full input before the slice;
+            # under the buggy cap-first order the slice lands inside
+            # the token and surfaces a 5-10 char ``sk-proj`` prefix.
+            #
+            # Asserts: zero raw token AND zero partial-token survival
+            # across (a) the stored ``sessions.directive_summary``
+            # column, (b) the JSON-serialized
+            # ``GET /projects/{id}/runs/{run_id}`` body, and (c) the
+            # JSON-serialized ``GET /projects/{id}/runs`` body — plus
+            # the ``[REDACTED:`` marker is present in the summary so we
+            # know the redact pass actually fired.
+            boundary_token = "sk-proj-TTTTTTTTTTTTTTTTTTTT"  # 28 chars
+            # Position the token so:
+            #   1. token start is BELOW the 200-char cap (174 < 200),
+            #   2. token end is ABOVE it (174 + 28 = 202 > 200) — i.e.
+            #      the token STRADDLES the cap boundary, so the buggy
+            #      cap-then-redact order would chop it mid-token into a
+            #      sub-20-char partial that no longer matches the
+            #      ``sk-proj-`` regex (the OpenAI key pattern requires
+            #      ≥20 chars after the prefix),
+            #   3. after redact-first, the 25-char marker
+            #      ``[REDACTED:openai_api_key]`` lands at positions
+            #      174-198 — fully BELOW the cap — so we can also
+            #      positively assert the marker survives, proving the
+            #      redact pass fired before any slice. The supervisor's
+            #      ``_summarize_directive`` overwrites the API's seed via
+            #      the upsert ON CONFLICT path, but both helpers use the
+            #      same redact-before-trim discipline so the final
+            #      column value still satisfies the property.
+            prefix_filler = "x" * 173 + " "  # 174 chars, ends on space
+            tail_filler = " " + "y" * 90  # 91 chars; total raw 293 chars
+            boundary_directive = prefix_filler + boundary_token + tail_filler
+            token_pos = boundary_directive.find(boundary_token)
+            assert 0 < token_pos < _API_DIRECTIVE_SUMMARY_LIMIT, (
+                f"scenario 30 setup bug: token_pos={token_pos}"
+            )
+            assert (
+                token_pos + len(boundary_token) > _API_DIRECTIVE_SUMMARY_LIMIT
+            ), (
+                f"scenario 30 setup bug: token does not straddle cap "
+                f"(pos={token_pos}, end={token_pos + len(boundary_token)})"
+            )
+            assert (
+                len(boundary_directive) > _API_DIRECTIVE_SUMMARY_LIMIT
+            ), f"scenario 30 setup bug: len={len(boundary_directive)}"
+            r = client.post(
+                f"/projects/{project_id}/directive?dry_run=true",
+                headers=auth,
+                json={"directive": boundary_directive, "max_steps": 2},
+            )
+            boundary_run_id = r.json().get("run_id") if r.status_code == 202 else None
+            assert boundary_run_id is not None
+            _wait_for_run(boundary_run_id, timeout_seconds=30.0)
+            stored = store.load_session(boundary_run_id)
+            stored_summary = stored.directive_summary if stored else ""
+            detail_r = client.get(
+                f"/projects/{project_id}/runs/{boundary_run_id}",
+                headers=auth,
+            )
+            list_r = client.get(
+                f"/projects/{project_id}/runs", headers=auth
+            )
+            detail_body = json.dumps(detail_r.json())
+            list_body = json.dumps(list_r.json())
+            partial_substrings = [boundary_token[:n] for n in (5, 8, 10, 12, 16, 20, 28)]
+            # The ``sk-proj`` and ``sk-proj-`` prefixes are also raw
+            # secret-shape leakage even though they're shorter than the
+            # full token; assert both as part of the no-leak property.
+            no_raw_in_summary = boundary_token not in stored_summary
+            no_partial_in_summary = all(p not in stored_summary for p in partial_substrings)
+            no_raw_in_detail = boundary_token not in detail_body
+            no_partial_in_detail = all(p not in detail_body for p in partial_substrings)
+            no_raw_in_list = boundary_token not in list_body
+            no_partial_in_list = all(p not in list_body for p in partial_substrings)
+            marker_in_summary = "[REDACTED:" in stored_summary
+            ok = (
+                detail_r.status_code == 200
+                and list_r.status_code == 200
+                and no_raw_in_summary
+                and no_partial_in_summary
+                and no_raw_in_detail
+                and no_partial_in_detail
+                and no_raw_in_list
+                and no_partial_in_list
+                and marker_in_summary
+            )
+            record(
+                "addendum-directive-summary-redact-before-trim",
+                ok,
+                f"token_pos={token_pos}, raw_len={len(boundary_directive)}, "
+                f"stored_summary_len={len(stored_summary)}, "
+                f"raw_in_summary={not no_raw_in_summary}, "
+                f"partial_in_summary={not no_partial_in_summary}, "
+                f"raw_in_detail={not no_raw_in_detail}, "
+                f"partial_in_detail={not no_partial_in_detail}, "
+                f"raw_in_list={not no_raw_in_list}, "
+                f"partial_in_list={not no_partial_in_list}, "
+                f"marker={marker_in_summary}",
             )
 
         finally:
